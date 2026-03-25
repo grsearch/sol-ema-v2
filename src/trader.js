@@ -155,9 +155,15 @@ async function buildSellOrder(tokenMint, tokenAmount) {
 
 // ── Execute with retry ─────────────────────────────────────────
 async function executeWithRetry(order, retries = 3) {
+  // Jupiter Ultra API 返回字段是 "transaction"，不是 "swapTransaction"
+  const txBase64 = order.transaction;
+  if (!txBase64) {
+    throw new Error(`Jupiter order missing transaction field. Response keys: ${Object.keys(order).join(', ')}`);
+  }
+
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const signed = signTx(order.swapTransaction);
+      const signed = signTx(txBase64);
       const result = await executeSwapOrder({
         requestId:         order.requestId,
         signedTransaction: signed,
@@ -179,7 +185,10 @@ async function executeWithRetry(order, retries = 3) {
  */
 async function buy(tokenState) {
   const { address, symbol, currentPrice } = tokenState;
-  logger.warn(`[Trader] BUY ${symbol} @ price ${currentPrice}`);
+
+  // 拉一次最新价格，确保 entryPrice 不为 null
+  const entryPrice = currentPrice ?? (await require('./birdeye').getPrice(address));
+  logger.warn(`[Trader] BUY ${symbol} @ price ${entryPrice}`);
 
   const solLamports = Math.floor(TRADE_SOL * LAMPORTS_PER_SOL);
 
@@ -187,20 +196,20 @@ async function buy(tokenState) {
     const order  = await buildBuyOrder(address, solLamports);
     const result = await executeWithRetry(order);
 
-    const tokenBalance = parseInt(result.outputAmount || '0');
+    const tokenBalance = parseInt(result.outputAmountResult || '0');
     logger.warn(`[Trader] BUY OK ${symbol} | sig=${result.signature?.slice(0,12)} | got=${tokenBalance} tokens`);
 
     const pos = {
-      tokenBalance,   // raw token units held
+      tokenBalance,
       solSpent:       TRADE_SOL,
-      entryPrice:     currentPrice,
-      peakPrice:      currentPrice,
-      tpHit:          [],         // which TP levels have fired
+      entryPrice:     entryPrice,
+      peakPrice:      entryPrice,
+      tpHit:          [],
       initialBalance: tokenBalance,
       txBuy:          result.signature,
     };
 
-    _broadcastTrade('BUY', symbol, address, currentPrice, TRADE_SOL, result.signature);
+    _broadcastTrade('BUY', symbol, address, entryPrice, TRADE_SOL, result.signature);
     return pos;
   } catch (e) {
     logger.warn(`[Trader] BUY FAILED ${symbol}: ${e.message}`);
@@ -226,7 +235,7 @@ async function sell(tokenState, fraction, reason) {
     const order  = await buildSellOrder(address, rawSellAmount);
     const result = await executeWithRetry(order);
 
-    const solReceived = parseInt(result.outputAmount || '0') / LAMPORTS_PER_SOL;
+    const solReceived = parseInt(result.outputAmountResult || '0') / LAMPORTS_PER_SOL;
     const newBalance  = position.tokenBalance - rawSellAmount;
 
     logger.warn(`[Trader] SELL OK ${symbol} | sig=${result.signature?.slice(0,12)} | received=${solReceived.toFixed(4)} SOL | remaining=${newBalance}`);
