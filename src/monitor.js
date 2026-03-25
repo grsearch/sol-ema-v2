@@ -19,11 +19,11 @@ const trader                           = require('./trader');
 const { broadcastToClients }           = require('./wsHub');
 const logger                           = require('./logger');
 
-const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '60');
-const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '300');
+const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '5');   // 5秒价格轮询 + 止损检查
+const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '300'); // 5分钟K线 + EMA死叉
 const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '240');
 const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD           || '20000');
-const MAX_TICKS_HISTORY  = 60 * 60 * 3;  // 3h of 1-min ticks = 180 ticks max
+const MAX_TICKS_HISTORY  = 60 * 60 * 3;  // 3h × 12 ticks/min = 2160 ticks max
 
 class TokenMonitor {
   static instance = null;
@@ -179,10 +179,17 @@ class TokenMonitor {
     logger.info('[Monitor] Stopped');
   }
 
-  // ── Price poll every PRICE_POLL_SEC (60s) ───────────────────
+  // ── 价格轮询 + 止损/止盈检查 每 PRICE_POLL_SEC (5s) ──────────
+  //
+  // 5秒拉一次价格，拉完立即检查：
+  //   • 硬止损 -25%
+  //   • 移动止损 峰值回撤 -30%
+  //   • 分批止盈 TP1/TP2/TP3
+  // EMA死叉 由 _evaluateAll (5分钟) 单独处理
   async _pollPrices() {
     for (const [addr, state] of this.tokens.entries()) {
       if (state.exitSent || !state.bought) continue;
+
       const price = await birdeye.getPrice(addr);
       if (price !== null && price > 0) {
         state.currentPrice = price;
@@ -190,51 +197,59 @@ class TokenMonitor {
         if (state.ticks.length > MAX_TICKS_HISTORY) {
           state.ticks.splice(0, state.ticks.length - MAX_TICKS_HISTORY);
         }
-        // Update live PnL
-        if (state.position && state.position.entryPrice) {
+
+        // 更新实时 PnL
+        if (state.position?.entryPrice) {
           state.pnlPct = (
             (price - state.position.entryPrice) / state.position.entryPrice * 100
           ).toFixed(2);
+          // 更新峰值（managePosition 内也会更新，这里提前跟踪方便 PnL 显示）
+          if (price > (state.position.peakPrice || 0)) {
+            state.position.peakPrice = price;
+          }
+        }
+
+        // ── 持仓中：每次拿到新价格立即检查止损/止盈 ──────────
+        if (state.inPosition && state.position && !state.exitSent) {
+          const action = await trader.managePosition(state);
+
+          if (action === 'EXIT') {
+            state.inPosition = false;
+            state.position   = null;
+            this._addTradeLog({ type: 'EXIT', symbol: state.symbol, reason: 'stop_or_trail' });
+            state.exitSent = true;
+            setTimeout(() => this._removeToken(addr, 'STOP_OR_TRAIL'), 5000);
+          } else if (action === 'PARTIAL') {
+            this._addTradeLog({ type: 'PARTIAL_SELL', symbol: state.symbol });
+          }
         }
       }
-      await sleep(200);  // stagger requests
+
+      await sleep(50);  // 50ms 间隔错开 Birdeye 请求
     }
   }
 
-  // ── EMA评估 every KLINE_INTERVAL_SEC (5 min) ────────────────
-  // 只负责出场：止盈/止损/移动止损/EMA死叉
+  // ── EMA死叉评估 每 KLINE_INTERVAL_SEC (5min) ────────────────
+  // 只负责 EMA9 下穿 EMA20 的趋势出场，止损/止盈已在 _pollPrices 处理
   async _evaluateAll() {
     for (const [addr, state] of this.tokens.entries()) {
       if (state.exitSent || !state.bought || !state.ticks.length) continue;
 
-      // 构建K线，排除最后一根（未收盘）
+      // 构建K线（所有代币都更新，dashboard 图表需要）
       state.candles = buildCandles(state.ticks, KLINE_INTERVAL_SEC);
       const closedCandles = state.candles.length > 1
         ? state.candles.slice(0, -1)
         : state.candles;
 
-      // ── 持仓中：检查止盈/止损/移动止损 ─────────────────────
-      if (state.inPosition && state.position) {
-        const action = await trader.managePosition(state);
-        if (action === 'EXIT') {
-          state.inPosition = false;
-          state.position   = null;
-          this._addTradeLog({ type: 'EXIT', symbol: state.symbol, reason: 'stop_or_trail' });
-          // 止损/移动止损触发后直接退出监控
-          state.exitSent = true;
-          setTimeout(() => this._removeToken(addr, 'STOP_OR_TRAIL'), 5000);
-          continue;
-        } else if (action === 'PARTIAL') {
-          this._addTradeLog({ type: 'PARTIAL_SELL', symbol: state.symbol });
-        }
-      }
-
-      // ── EMA死叉检查（仅出场，不再买入）─────────────────────
+      // 计算 EMA（用于 dashboard 显示）
       const result = evaluateSignal(closedCandles, state);
       state.ema9   = result.ema9;
       state.ema20  = result.ema20;
 
-      if (result.signal === 'SELL' && state.inPosition) {
+      if (!state.inPosition) continue;  // 不持仓无需死叉出场
+
+      // EMA 死叉出场
+      if (result.signal === 'SELL') {
         logger.warn(`[Strategy] EMA死叉 SELL ${state.symbol} — ${result.reason}`);
         await this._doExit(state, result.reason);
       }

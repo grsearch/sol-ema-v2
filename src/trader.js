@@ -22,11 +22,17 @@ const { broadcastToClients } = require('./wsHub');
 // ── Config ─────────────────────────────────────────────────────
 const HELIUS_RPC      = process.env.HELIUS_RPC_URL       || '';
 const JUP_API         = process.env.JUPITER_API_URL      || 'https://api.jup.ag';
+const JUP_API_KEY     = process.env.JUPITER_API_KEY      || '';   // Pro I key
 const SLIPPAGE_BPS    = parseInt(process.env.SLIPPAGE_BPS            || '300');
 const USE_JITO        = process.env.USE_JITO === 'true';
 const JITO_TIP        = parseInt(process.env.JITO_TIP_LAMPORTS       || '1000000');
 const PRIORITY_FEE    = parseInt(process.env.PRIORITY_FEE_MICROLAMPORTS || '100000');
 const TRADE_SOL       = parseFloat(process.env.TRADE_SIZE_SOL        || '0.5');
+
+// Jupiter Pro I 请求头 — 有 Key 就带上，提升速率限制
+function jupHeaders() {
+  return JUP_API_KEY ? { 'x-api-key': JUP_API_KEY } : {};
+}
 
 // Take-profit levels
 const TP1_PCT   = parseFloat(process.env.TP1_PCT  || '100');   // +100%
@@ -76,9 +82,10 @@ async function getSwapOrder({ inputMint, outputMint, amount, slippageBps }) {
       slippageBps: slippageBps ?? SLIPPAGE_BPS,
       taker:       getKeypair().publicKey.toBase58(),
     },
+    headers: jupHeaders(),
     timeout: 10000,
   });
-  return data;  // { swapType, requestId, inAmount, outAmount, swapTransaction, ... }
+  return data;
 }
 
 /**
@@ -90,8 +97,11 @@ async function executeSwapOrder({ requestId, signedTransaction }) {
   const { data } = await axios.post(url, {
     requestId,
     signedTransaction,
-  }, { timeout: 30000 });
-  return data;  // { status, signature, inputAmount, outputAmount, ... }
+  }, {
+    headers: jupHeaders(),
+    timeout: 30000,
+  });
+  return data;
 }
 
 /**
