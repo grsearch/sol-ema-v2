@@ -214,13 +214,22 @@ class TokenMonitor {
           const action = await trader.managePosition(state);
 
           if (action === 'EXIT') {
+            // 止损 / 移动止损 → 全仓清出，立即退出白名单
             state.inPosition = false;
             state.position   = null;
+            state.exitSent   = true;
             this._addTradeLog({ type: 'EXIT', symbol: state.symbol, reason: 'stop_or_trail' });
-            state.exitSent = true;
             setTimeout(() => this._removeToken(addr, 'STOP_OR_TRAIL'), 5000);
+
           } else if (action === 'PARTIAL') {
             this._addTradeLog({ type: 'PARTIAL_SELL', symbol: state.symbol });
+            // 分批卖出后若仓位已归零（不太可能但做保护）→ 退出白名单
+            if (!state.position || state.position.tokenBalance <= 0) {
+              state.inPosition = false;
+              state.position   = null;
+              state.exitSent   = true;
+              setTimeout(() => this._removeToken(addr, 'PARTIAL_FULLY_SOLD'), 5000);
+            }
           }
         }
       }
