@@ -187,10 +187,7 @@ async function executeWithRetry(order, retries = 3) {
  */
 async function buy(tokenState) {
   const { address, symbol, currentPrice } = tokenState;
-
-  // 拉一次最新价格，确保 entryPrice 不为 null
-  const entryPrice = currentPrice ?? (await require('./birdeye').getPrice(address));
-  logger.warn(`[Trader] BUY ${symbol} @ price ${entryPrice}`);
+  logger.warn(`[Trader] BUY ${symbol} @ Birdeye=${currentPrice}`);
 
   const solLamports = Math.floor(TRADE_SOL * LAMPORTS_PER_SOL);
 
@@ -198,20 +195,38 @@ async function buy(tokenState) {
     const order  = await buildBuyOrder(address, solLamports);
     const result = await executeWithRetry(order);
 
-    const tokenBalance = parseInt(result.outputAmountResult || '0');
-    logger.warn(`[Trader] BUY OK ${symbol} | sig=${result.signature?.slice(0,12)} | got=${tokenBalance} tokens`);
+    const tokenBalance      = parseInt(result.outputAmountResult || '0');
+    const solSpentLamports  = parseInt(result.inputAmountResult  || String(solLamports));
+
+    // 真实开仓价：实际花费SOL / 实际获得token数量
+    // inputAmountResult 单位是 lamports，除以 1e9 得 SOL
+    // outputAmountResult 是 token 原始单位，需要知道 decimals 才能转换
+    // 这里统一用"每个原始token单位花了多少SOL lamports"作为内部价格单位
+    // 与 Birdeye 返回的 USD 价格不同，仅用于盈亏比例计算（比例正确即可）
+    const realEntryPrice = tokenBalance > 0
+      ? solSpentLamports / tokenBalance   // lamports per token-unit
+      : (currentPrice ?? 0);
+
+    logger.warn(
+      `[Trader] BUY OK ${symbol}` +
+      ` | sig=${result.signature?.slice(0, 12)}` +
+      ` | got=${tokenBalance} tokens` +
+      ` | spent=${(solSpentLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL` +
+      ` | realEntryPrice=${realEntryPrice.toExponential(4)} lam/token`
+    );
 
     const pos = {
       tokenBalance,
-      solSpent:       TRADE_SOL,
-      entryPrice:     entryPrice,
-      peakPrice:      entryPrice,
+      solSpent:       solSpentLamports / LAMPORTS_PER_SOL,
+      entryPrice:     realEntryPrice,    // lamports/token — 用于止损/止盈比例计算
+      entryPriceUsd:  currentPrice,      // USD 价格 — 仅用于 dashboard 显示
+      peakPrice:      realEntryPrice,
       tpHit:          [],
       initialBalance: tokenBalance,
       txBuy:          result.signature,
     };
 
-    _broadcastTrade('BUY', symbol, address, entryPrice, TRADE_SOL, result.signature);
+    _broadcastTrade('BUY', symbol, address, currentPrice, pos.solSpent, result.signature);
     return pos;
   } catch (e) {
     logger.warn(`[Trader] BUY FAILED ${symbol}: ${e.message}`);
@@ -263,15 +278,22 @@ async function managePosition(tokenState) {
   const { currentPrice, position } = tokenState;
   if (!position || position.tokenBalance <= 0) return 'NONE';
 
-  const entryPrice = position.entryPrice;
-  const pnlPct     = (currentPrice - entryPrice) / entryPrice * 100;
+  // ── 价格单位统一 ──────────────────────────────────────────────
+  // entryPrice     = lamports/token（Jupiter实际成交价，用于比例计算）
+  // entryPriceUsd  = USD（买入时Birdeye价格，用于换算当前比例）
+  // currentPrice   = USD（当前Birdeye价格）
+  //
+  // 盈亏比例 = (currentPrice - entryPriceUsd) / entryPriceUsd
+  // 两种价格的比例是一致的，用USD比例即可，无需换算lamports
+  const entryPriceUsd = position.entryPriceUsd ?? position.entryPrice;  // 兼容旧数据
+  const pnlPct = (currentPrice - entryPriceUsd) / entryPriceUsd * 100;
 
-  // 更新峰值
-  if (currentPrice > position.peakPrice) {
-    tokenState.position.peakPrice = currentPrice;
+  // 更新峰值（用USD价格跟踪）
+  if (currentPrice > (position.peakPriceUsd ?? 0)) {
+    tokenState.position.peakPriceUsd = currentPrice;
   }
-  const peakPrice  = tokenState.position.peakPrice;
-  const peakPnlPct = (peakPrice - entryPrice) / entryPrice * 100;
+  const peakPriceUsd = tokenState.position.peakPriceUsd ?? currentPrice;
+  const peakPnlPct   = (peakPriceUsd - entryPriceUsd) / entryPriceUsd * 100;
 
   // ── 1. 硬止损 -25% ─────────────────────────────────────────
   if (pnlPct <= -STOP_LOSS_PCT) {
@@ -286,7 +308,7 @@ async function managePosition(tokenState) {
   //     峰值 +100% 时止损线在 2.0×0.7 = 1.40 倍成本（锁住40%）
   //     峰值 +400% 时止损线在 5.0×0.7 = 3.50 倍成本（锁住大量利润）
   if (peakPnlPct >= TRAIL_ACTIVATE_PCT) {
-    const trailStop = peakPrice * (1 - TRAIL_PCT / 100);
+    const trailStop = peakPriceUsd * (1 - TRAIL_PCT / 100);
     if (currentPrice <= trailStop) {
       logger.warn(
         `[Trader] TRAIL-STOP ${tokenState.symbol}` +
