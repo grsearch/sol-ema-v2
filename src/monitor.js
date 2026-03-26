@@ -1,7 +1,8 @@
 // src/monitor.js — Core monitoring engine (Singleton)
 //
 // 买入策略：收录即买
-//   webhook 收到代币 → 查 FDV → FDV ≥ $20,000 → 立即用 0.5 SOL 买入
+//   webhook 收到代币 → 查 FDV → $20,000 ≤ FDV ≤ $50,000 → 立即用 0.5 SOL 买入
+//   FDV 超出范围（未知、过低、过高）→ 静默拒绝，不再跟踪
 //
 // 出场策略（EMA 只用于出场）：
 //   1. 硬止损    -25%
@@ -23,6 +24,7 @@ const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '1');  
 const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '300'); // 5分钟K线 + EMA死叉
 const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '240');
 const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD           || '20000');
+const FDV_MAX_USD        = parseInt(process.env.FDV_MAX_USD           || '50000');
 const MAX_TICKS_HISTORY  = 60 * 60 * 3;  // 3h × 12 ticks/min = 2160 ticks max
 
 class TokenMonitor {
@@ -100,11 +102,19 @@ class TokenMonitor {
       logger.warn(`[Monitor] meta fetch error ${state.symbol}: ${e.message}`);
     }
 
-    // FDV 门槛检查
+    // FDV 门槛检查（下限 + 上限）
     if (state.fdv === null || state.fdv < FDV_MIN_USD) {
       const reason = state.fdv === null
         ? 'FDV_UNKNOWN'
         : `FDV_TOO_LOW($${state.fdv}<$${FDV_MIN_USD})`;
+      logger.warn(`[Monitor] ⛔ ${state.symbol} rejected — ${reason}`);
+      state.exitSent = true;
+      setTimeout(() => this._removeToken(state.address, reason), 1000);
+      return;
+    }
+
+    if (state.fdv > FDV_MAX_USD) {
+      const reason = `FDV_TOO_HIGH($${state.fdv}>$${FDV_MAX_USD})`;
       logger.warn(`[Monitor] ⛔ ${state.symbol} rejected — ${reason}`);
       state.exitSent = true;
       setTimeout(() => this._removeToken(state.address, reason), 1000);
