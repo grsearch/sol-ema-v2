@@ -5,7 +5,7 @@
 //   • Anti-sandwich via Jito bundle tip + priority fee
 //   • Tiered TP: sells a fraction of holdings at each profit level
 //   • Hard stop-loss: -25% from entry
-//   • Trailing stop: 30% pullback from peak once up 100%+
+//   • Trailing stop: 30% pullback from peak, activates once up 30%+
 //   • EMA death-cross: sells remainder of position
 
 'use strict';
@@ -45,6 +45,8 @@ const TP3_SELL  = parseFloat(process.env.TP3_SELL || '50');
 
 const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || '25');
 const TRAIL_PCT     = parseFloat(process.env.TRAIL_PCT     || '30');
+// 移动止损激活门槛：峰值涨幅超过此值后激活（默认30%）
+const TRAIL_ACTIVATE_PCT = parseFloat(process.env.TRAIL_ACTIVATE_PCT || '30');
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -249,12 +251,13 @@ async function sell(tokenState, fraction, reason) {
   }
 }
 
-// ── Position manager — called every EMA eval cycle ────────────
+// ── Position manager — called every price tick (1s) ───────────
 /**
- * Check stop-loss, trailing stop, and take-profit levels.
- * Returns 'HOLD', 'PARTIAL', or 'EXIT'.
- *
- * Mutates tokenState.position (updates peakPrice, tpHit, tokenBalance).
+ * 出场优先级：
+ *   1. 硬止损      价格跌破买入价 -25%
+ *   2. 移动止损    峰值涨幅 >= 30% 后激活，峰值回撤 -30% → 出场
+ *   3. 分批止盈    TP1/TP2/TP3
+ * Returns 'HOLD' | 'PARTIAL' | 'EXIT'
  */
 async function managePosition(tokenState) {
   const { currentPrice, position } = tokenState;
@@ -263,30 +266,40 @@ async function managePosition(tokenState) {
   const entryPrice = position.entryPrice;
   const pnlPct     = (currentPrice - entryPrice) / entryPrice * 100;
 
-  // Update peak
+  // 更新峰值
   if (currentPrice > position.peakPrice) {
     tokenState.position.peakPrice = currentPrice;
   }
-  const peakPrice = tokenState.position.peakPrice;
+  const peakPrice  = tokenState.position.peakPrice;
+  const peakPnlPct = (peakPrice - entryPrice) / entryPrice * 100;
 
-  // ── Hard stop-loss ──────────────────────────────────────────
+  // ── 1. 硬止损 -25% ─────────────────────────────────────────
   if (pnlPct <= -STOP_LOSS_PCT) {
     logger.warn(`[Trader] STOP-LOSS ${tokenState.symbol} PnL=${pnlPct.toFixed(1)}%`);
     tokenState.position = await sell(tokenState, 1.0, `STOP_LOSS_${STOP_LOSS_PCT}%`);
     return 'EXIT';
   }
 
-  // ── Trailing stop (active once up >= 100%) ──────────────────
-  if (pnlPct >= 100) {
+  // ── 2. 移动止损（峰值涨幅 >= 30% 后激活，回撤 -30% 触发）──
+  // 激活后止损线 = peakPrice × (1 - TRAIL_PCT/100)
+  // 例：峰值 +50% 时止损线在 1.5×0.7 = 1.05 倍成本（接近保本）
+  //     峰值 +100% 时止损线在 2.0×0.7 = 1.40 倍成本（锁住40%）
+  //     峰值 +400% 时止损线在 5.0×0.7 = 3.50 倍成本（锁住大量利润）
+  if (peakPnlPct >= TRAIL_ACTIVATE_PCT) {
     const trailStop = peakPrice * (1 - TRAIL_PCT / 100);
     if (currentPrice <= trailStop) {
-      logger.warn(`[Trader] TRAIL-STOP ${tokenState.symbol} peak=${peakPrice.toExponential(4)} stop=${trailStop.toExponential(4)}`);
-      tokenState.position = await sell(tokenState, 1.0, `TRAIL_STOP_${TRAIL_PCT}%`);
+      logger.warn(
+        `[Trader] TRAIL-STOP ${tokenState.symbol}` +
+        ` peak=+${peakPnlPct.toFixed(0)}%` +
+        ` trailStop=${trailStop.toExponential(3)}` +
+        ` now=${pnlPct.toFixed(1)}%`
+      );
+      tokenState.position = await sell(tokenState, 1.0, `TRAIL_STOP_peak+${peakPnlPct.toFixed(0)}%`);
       return 'EXIT';
     }
   }
 
-  // ── Tiered take-profits ─────────────────────────────────────
+  // ── 3. 分批止盈 TP1/TP2/TP3 ────────────────────────────────
   let acted = false;
 
   if (!position.tpHit.includes('TP1') && pnlPct >= TP1_PCT) {
