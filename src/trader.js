@@ -4,7 +4,7 @@
 //   • Uses Jupiter Ultra API (Pro I) for swap quote + execute
 //   • Anti-sandwich via Jito bundle tip + priority fee
 //   • Tiered TP: sells a fraction of holdings at each profit level
-//   • Hard stop-loss: -25% from entry
+//   • Hard stop-loss: -30% from entry
 //   • Trailing stop: 30% pullback from peak, activates once up 50%+
 //   • EMA death-cross: sells remainder of position
 
@@ -222,46 +222,18 @@ async function buy(tokenState) {
 
     const pos = {
       tokenBalance,
-      initialBalance:  tokenBalance,
-      solSpentLamports,
-      solSpent:        solSpentLamports / LAMPORTS_PER_SOL,
-      peakSolValue:    solSpentLamports,
-      tpHit:           [],
-      txBuy:           result.signature,
-      entryPriceUsd,      // execute完成后拉的Birdeye价，用于止损比例基准
-      peakPriceUsd:    entryPriceUsd,
+      initialBalance: tokenBalance,
+      solSpent:       solSpentLamports / LAMPORTS_PER_SOL,
+      tpHit:          [],
+      txBuy:          result.signature,
+      entryPriceUsd,    // execute完成后重新拉的Birdeye价，止损基准
+      peakPriceUsd:   entryPriceUsd,
     };
 
     _broadcastTrade('BUY', symbol, address, entryPriceUsd, pos.solSpent, result.signature);
     return pos;
   } catch (e) {
     logger.warn(`[Trader] BUY FAILED ${symbol}: ${e.message}`);
-    return null;
-  }
-}
-
-// ── 查询当前持仓的 SOL 价值（Jupiter /quote 报价）─────────────
-// 使用轻量的 Swap API /quote 接口，不需要 taker，专用于价格查询
-// 比 /ultra/v1/order 更快更稳，失败率更低
-async function getCurrentSolValue(tokenMint, tokenAmount) {
-  try {
-    const url = `${JUP_API}/swap/v1/quote`;
-    const { data } = await axios.get(url, {
-      params: {
-        inputMint:          tokenMint,
-        outputMint:         SOL_MINT,
-        amount:             Math.floor(tokenAmount).toString(),
-        slippageBps:        SLIPPAGE_BPS,
-        onlyDirectRoutes:   false,
-      },
-      headers: jupHeaders(),
-      timeout: 5000,
-    });
-    // /quote 返回 outAmount（lamports）
-    const outLam = parseInt(data?.outAmount || data?.outputAmount || '0');
-    return outLam > 0 ? outLam : null;
-  } catch (e) {
-    logger.warn(`[Trader] getCurrentSolValue failed: ${e.message}`);
     return null;
   }
 }
@@ -300,69 +272,52 @@ async function sell(tokenState, fraction, reason) {
 
 // ── Position manager — called every price tick (1s) ───────────
 /**
- * 所有止损止盈基于 SOL 价值，不依赖 Birdeye USD 价格：
- *   currentSolValue = Jupiter 卖出报价（当前 token 能换回多少 SOL lamports）
- *   pnlPct = (currentSolValue - solSpentLamports) / solSpentLamports × 100
+ * 止损止盈全部基于 Birdeye USD 价格：
+ *   pnlPct = (currentPrice - entryPriceUsd) / entryPriceUsd × 100
+ *
+ * 不用 Jupiter 报价的原因：新币流动性浅，报价滑点极大，
+ * 会导致"价格没跌但报价显示亏损"的假止损。
  *
  * 出场优先级：
- *   1. 硬止损      SOL价值跌破成本 -25%
- *   2. 移动止损    SOL峰值涨幅 >= 30% 后激活，从峰值回撤 -30% → 出场
- *   3. 分批止盈    TP1/TP2/TP3（基于SOL价值涨幅）
+ *   1. 硬止损      -25%
+ *   2. 移动止损    峰值涨幅 >= 50% 后激活，峰值回撤 -30% → 出场
+ *   3. 分批止盈    TP1/TP2/TP3
  * Returns 'HOLD' | 'PARTIAL' | 'EXIT'
  */
 async function managePosition(tokenState) {
-  const { address, symbol, position } = tokenState;
+  const { currentPrice, position, symbol } = tokenState;
   if (!position || position.tokenBalance <= 0) return 'NONE';
 
-  // ── 向 Jupiter 拉当前卖出报价（SOL lamports）──────────────
-  const currentSolLam = await getCurrentSolValue(address, position.tokenBalance);
+  const entryPriceUsd = position.entryPriceUsd;
+  if (!entryPriceUsd || !currentPrice) return 'HOLD';
 
-  let pnlPct;
-  if (currentSolLam !== null) {
-    // 优先用 Jupiter SOL 报价计算（最准确）
-    const cost = position.solSpentLamports;
-    pnlPct = (currentSolLam - cost) / cost * 100;
+  const pnlPct = (currentPrice - entryPriceUsd) / entryPriceUsd * 100;
 
-    // 更新峰值 SOL 价值
-    if (currentSolLam > position.peakSolValue) {
-      tokenState.position.peakSolValue = currentSolLam;
-    }
-  } else {
-    // Jupiter 报价失败时，用 Birdeye USD 价格兜底（仍然保护止损）
-    const entryUsd = position.entryPriceUsd;
-    const currentPrice = tokenState.currentPrice;
-    if (!entryUsd || !currentPrice) return 'HOLD';
-    pnlPct = (currentPrice - entryUsd) / entryUsd * 100;
-    logger.warn(`[Trader] Using Birdeye fallback for ${symbol} PnL: ${pnlPct.toFixed(1)}%`);
-  }
-
-  const peakSolValue = tokenState.position.peakSolValue;
-  const cost         = position.solSpentLamports;
-  const peakPnlPct   = (peakSolValue - cost) / cost * 100;
-
-  // 同步更新 USD 峰值（仅供 dashboard 显示）
-  const currentPrice = tokenState.currentPrice;
-  if (currentPrice && currentPrice > (position.peakPriceUsd ?? 0)) {
+  // 更新峰值 USD 价格
+  if (currentPrice > (position.peakPriceUsd ?? 0)) {
     tokenState.position.peakPriceUsd = currentPrice;
   }
+  const peakPriceUsd = tokenState.position.peakPriceUsd;
+  const peakPnlPct   = (peakPriceUsd - entryPriceUsd) / entryPriceUsd * 100;
 
-  // 更新 pnlPct 供 dashboard 显示
+  // 更新 dashboard 显示
   tokenState.pnlPct = pnlPct.toFixed(2);
 
   // ── 1. 硬止损 -25% ─────────────────────────────────────────
   if (pnlPct <= -STOP_LOSS_PCT) {
-    logger.warn(`[Trader] STOP-LOSS ${symbol} SOL_PnL=${pnlPct.toFixed(1)}%`);
+    logger.warn(`[Trader] STOP-LOSS ${symbol} PnL=${pnlPct.toFixed(1)}%`);
     tokenState.position = await sell(tokenState, 1.0, `STOP_LOSS_${STOP_LOSS_PCT}%`);
     return 'EXIT';
   }
 
-  // ── 2. 移动止损（SOL峰值涨幅 >= 30% 后激活）───────────────
-  if (peakPnlPct >= TRAIL_ACTIVATE_PCT && currentSolLam !== null) {
-    const trailStop = peakSolValue * (1 - TRAIL_PCT / 100);
-    if (currentSolLam <= trailStop) {
+  // ── 2. 移动止损（峰值涨幅 >= 50% 后激活，回撤 -30% 触发）──
+  if (peakPnlPct >= TRAIL_ACTIVATE_PCT) {
+    const trailStop = peakPriceUsd * (1 - TRAIL_PCT / 100);
+    if (currentPrice <= trailStop) {
       logger.warn(
         `[Trader] TRAIL-STOP ${symbol}` +
         ` peak=+${peakPnlPct.toFixed(0)}%` +
+        ` trailStop=${trailStop.toExponential(3)}` +
         ` now=${pnlPct.toFixed(1)}%`
       );
       tokenState.position = await sell(tokenState, 1.0, `TRAIL_STOP_peak+${peakPnlPct.toFixed(0)}%`);
