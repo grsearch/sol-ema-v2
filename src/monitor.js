@@ -19,7 +19,7 @@ const trader                           = require('./trader');
 const { broadcastToClients }           = require('./wsHub');
 const logger                           = require('./logger');
 
-const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '5');   // 5秒价格轮询 + 止损检查
+const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '1');   // 1秒价格轮询 + 止损检查
 const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '300'); // 5分钟K线 + EMA死叉
 const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '240');
 const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD           || '20000');
@@ -179,11 +179,11 @@ class TokenMonitor {
     logger.info('[Monitor] Stopped');
   }
 
-  // ── 价格轮询 + 止损/止盈检查 每 PRICE_POLL_SEC (5s) ──────────
+  // ── 价格轮询 + 止损/止盈检查 每 PRICE_POLL_SEC (1s) ──────────
   //
-  // 5秒拉一次价格，拉完立即检查：
+  // 1秒拉一次价格，拉完立即检查：
   //   • 硬止损 -25%
-  //   • 移动止损 峰值回撤 -30%
+  //   • 移动止损 峰值涨幅≥30% 后激活，回撤-30% 触发
   //   • 分批止盈 TP1/TP2/TP3
   // EMA死叉 由 _evaluateAll (5分钟) 单独处理
   async _pollPrices() {
@@ -234,7 +234,7 @@ class TokenMonitor {
         }
       }
 
-      await sleep(50);  // 50ms 间隔错开 Birdeye 请求
+      await sleep(10);  // 10ms 间隔错开 Birdeye 请求（1s轮询下最多100个代币仍安全）
     }
   }
 
