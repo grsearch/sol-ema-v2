@@ -208,14 +208,13 @@ class TokenMonitor {
           state.ticks.splice(0, state.ticks.length - MAX_TICKS_HISTORY);
         }
 
-        // 更新实时 PnL
-        if (state.position?.entryPrice) {
-          state.pnlPct = (
-            (price - state.position.entryPrice) / state.position.entryPrice * 100
-          ).toFixed(2);
-          // 更新峰值（managePosition 内也会更新，这里提前跟踪方便 PnL 显示）
-          if (price > (state.position.peakPrice || 0)) {
-            state.position.peakPrice = price;
+        // 更新实时 PnL（用USD价格计算，entryPriceUsd 是买入时的Birdeye价格）
+        if (state.position) {
+          const entryUsd = state.position.entryPriceUsd ?? state.position.entryPrice;
+          if (entryUsd) {
+            state.pnlPct = (
+              (price - entryUsd) / entryUsd * 100
+            ).toFixed(2);
           }
         }
 
@@ -339,10 +338,10 @@ class TokenMonitor {
       lp:            s.lp,
       fdv:           s.fdv,
       currentPrice:  s.currentPrice,
-      entryPrice:    pos?.entryPrice   ?? null,
-      peakPrice:     pos?.peakPrice    ?? null,
-      tokenBalance:  pos?.tokenBalance ?? 0,
-      tpHit:         pos?.tpHit        ?? [],
+      entryPrice:    pos?.entryPriceUsd ?? pos?.entryPrice ?? null,  // dashboard显示USD价格
+      peakPrice:     pos?.peakPriceUsd  ?? pos?.peakPrice  ?? null,  // dashboard显示USD峰值
+      tokenBalance:  pos?.tokenBalance  ?? 0,
+      tpHit:         pos?.tpHit         ?? [],
       pnlPct:        s.pnlPct,
       ema9:          isNaN(s.ema9)  ? null : +s.ema9.toFixed(10),
       ema20:         isNaN(s.ema20) ? null : +s.ema20.toFixed(10),
