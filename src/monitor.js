@@ -153,11 +153,9 @@ class TokenMonitor {
         state.age = ((Date.now() - created * 1000) / 60000).toFixed(1);
       }
 
-      // FDV dropped below minimum while in position → forced exit
-      if (state.inPosition && state.fdv !== null && state.fdv < FDV_MIN_USD) {
-        logger.warn(`[Monitor] ⚠️  FDV dropped: ${state.symbol} FDV=$${state.fdv} — exiting`);
-        await this._doExit(state, `FDV_DROPPED($${state.fdv}<$${FDV_MIN_USD})`);
-      }
+      // 注意：持仓期间不再因 FDV 下跌触发退出
+      // 新币 FDV 极不稳定，买入后几秒内 Birdeye 重算可能导致误判
+      // FDV 门槛仅在收录时（_fetchMetaAndBuy）做一次性判断
     } catch (e) {
       logger.warn(`[Monitor] meta refresh error ${state.symbol}: ${e.message}`);
     }
@@ -210,8 +208,8 @@ class TokenMonitor {
 
         // 更新实时 PnL 由 managePosition 负责（基于Jupiter SOL报价）
         // 这里仅更新 dashboard 显示用的 USD 峰值
-        if (state.position && currentPrice > (state.position.peakPriceUsd ?? 0)) {
-          state.position.peakPriceUsd = currentPrice;
+        if (state.position && price > (state.position.peakPriceUsd ?? 0)) {
+          state.position.peakPriceUsd = price;
         }
 
         // ── 持仓中：每次拿到新价格立即检查止损/止盈 ──────────
