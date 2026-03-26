@@ -208,14 +208,10 @@ class TokenMonitor {
           state.ticks.splice(0, state.ticks.length - MAX_TICKS_HISTORY);
         }
 
-        // 更新实时 PnL（用USD价格计算，entryPriceUsd 是买入时的Birdeye价格）
-        if (state.position) {
-          const entryUsd = state.position.entryPriceUsd ?? state.position.entryPrice;
-          if (entryUsd) {
-            state.pnlPct = (
-              (price - entryUsd) / entryUsd * 100
-            ).toFixed(2);
-          }
+        // 更新实时 PnL 由 managePosition 负责（基于Jupiter SOL报价）
+        // 这里仅更新 dashboard 显示用的 USD 峰值
+        if (state.position && currentPrice > (state.position.peakPriceUsd ?? 0)) {
+          state.position.peakPriceUsd = currentPrice;
         }
 
         // ── 持仓中：每次拿到新价格立即检查止损/止盈 ──────────
