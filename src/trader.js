@@ -195,41 +195,52 @@ async function buy(tokenState) {
     const order  = await buildBuyOrder(address, solLamports);
     const result = await executeWithRetry(order);
 
-    const tokenBalance      = parseInt(result.outputAmountResult || '0');
-    const solSpentLamports  = parseInt(result.inputAmountResult  || String(solLamports));
-
-    // 真实开仓价：实际花费SOL / 实际获得token数量
-    // inputAmountResult 单位是 lamports，除以 1e9 得 SOL
-    // outputAmountResult 是 token 原始单位，需要知道 decimals 才能转换
-    // 这里统一用"每个原始token单位花了多少SOL lamports"作为内部价格单位
-    // 与 Birdeye 返回的 USD 价格不同，仅用于盈亏比例计算（比例正确即可）
-    const realEntryPrice = tokenBalance > 0
-      ? solSpentLamports / tokenBalance   // lamports per token-unit
-      : (currentPrice ?? 0);
+    const tokenBalance     = parseInt(result.outputAmountResult || '0');
+    const solSpentLamports = parseInt(result.inputAmountResult  || String(solLamports));
 
     logger.warn(
       `[Trader] BUY OK ${symbol}` +
       ` | sig=${result.signature?.slice(0, 12)}` +
       ` | got=${tokenBalance} tokens` +
-      ` | spent=${(solSpentLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL` +
-      ` | realEntryPrice=${realEntryPrice.toExponential(4)} lam/token`
+      ` | spent=${(solSpentLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL`
     );
 
     const pos = {
       tokenBalance,
-      solSpent:       solSpentLamports / LAMPORTS_PER_SOL,
-      entryPrice:     realEntryPrice,    // lamports/token — 用于止损/止盈比例计算
-      entryPriceUsd:  currentPrice,      // USD 价格 — 仅用于 dashboard 显示
-      peakPrice:      realEntryPrice,
-      tpHit:          [],
-      initialBalance: tokenBalance,
-      txBuy:          result.signature,
+      initialBalance:  tokenBalance,
+      // ── 成本基准：全部以 SOL lamports 为单位，不依赖 USD 价格 ──
+      solSpentLamports,                          // 实际花费（lamports）
+      solSpent:        solSpentLamports / LAMPORTS_PER_SOL,
+      peakSolValue:    solSpentLamports,          // 峰值 SOL 价值（lamports），初始=成本
+      tpHit:           [],
+      txBuy:           result.signature,
+      // USD 价格仅用于 dashboard 显示，不用于止损计算
+      entryPriceUsd:   currentPrice,
+      peakPriceUsd:    currentPrice,
     };
 
     _broadcastTrade('BUY', symbol, address, currentPrice, pos.solSpent, result.signature);
     return pos;
   } catch (e) {
     logger.warn(`[Trader] BUY FAILED ${symbol}: ${e.message}`);
+    return null;
+  }
+}
+
+// ── 查询当前持仓的 SOL 价值（Jupiter 卖出报价）──────────────
+// 用实际 token 余额向 Jupiter 请求 quote，得到能换回多少 SOL lamports
+// 这是最准确的当前价值，不依赖任何外部 USD 价格
+async function getCurrentSolValue(tokenMint, tokenAmount) {
+  try {
+    const order = await getSwapOrder({
+      inputMint:   tokenMint,
+      outputMint:  SOL_MINT,
+      amount:      tokenAmount,
+      slippageBps: SLIPPAGE_BPS,
+    });
+    return parseInt(order.outAmount || order.outputAmount || '0');
+  } catch (e) {
+    logger.warn(`[Trader] getCurrentSolValue failed: ${e.message}`);
     return null;
   }
 }
@@ -268,52 +279,57 @@ async function sell(tokenState, fraction, reason) {
 
 // ── Position manager — called every price tick (1s) ───────────
 /**
+ * 所有止损止盈基于 SOL 价值，不依赖 Birdeye USD 价格：
+ *   currentSolValue = Jupiter 卖出报价（当前 token 能换回多少 SOL lamports）
+ *   pnlPct = (currentSolValue - solSpentLamports) / solSpentLamports × 100
+ *
  * 出场优先级：
- *   1. 硬止损      价格跌破买入价 -25%
- *   2. 移动止损    峰值涨幅 >= 30% 后激活，峰值回撤 -30% → 出场
- *   3. 分批止盈    TP1/TP2/TP3
+ *   1. 硬止损      SOL价值跌破成本 -25%
+ *   2. 移动止损    SOL峰值涨幅 >= 30% 后激活，从峰值回撤 -30% → 出场
+ *   3. 分批止盈    TP1/TP2/TP3（基于SOL价值涨幅）
  * Returns 'HOLD' | 'PARTIAL' | 'EXIT'
  */
 async function managePosition(tokenState) {
-  const { currentPrice, position } = tokenState;
+  const { address, symbol, position } = tokenState;
   if (!position || position.tokenBalance <= 0) return 'NONE';
 
-  // ── 价格单位统一 ──────────────────────────────────────────────
-  // entryPrice     = lamports/token（Jupiter实际成交价，用于比例计算）
-  // entryPriceUsd  = USD（买入时Birdeye价格，用于换算当前比例）
-  // currentPrice   = USD（当前Birdeye价格）
-  //
-  // 盈亏比例 = (currentPrice - entryPriceUsd) / entryPriceUsd
-  // 两种价格的比例是一致的，用USD比例即可，无需换算lamports
-  const entryPriceUsd = position.entryPriceUsd ?? position.entryPrice;  // 兼容旧数据
-  const pnlPct = (currentPrice - entryPriceUsd) / entryPriceUsd * 100;
+  // ── 向 Jupiter 拉当前卖出报价（SOL lamports）──────────────
+  const currentSolLam = await getCurrentSolValue(address, position.tokenBalance);
+  if (currentSolLam === null) return 'HOLD';  // 报价失败，跳过本次检查
 
-  // 更新峰值（用USD价格跟踪）
-  if (currentPrice > (position.peakPriceUsd ?? 0)) {
+  const cost       = position.solSpentLamports;
+  const pnlPct     = (currentSolLam - cost) / cost * 100;
+
+  // 更新峰值 SOL 价值
+  if (currentSolLam > position.peakSolValue) {
+    tokenState.position.peakSolValue = currentSolLam;
+  }
+  const peakSolValue = tokenState.position.peakSolValue;
+  const peakPnlPct   = (peakSolValue - cost) / cost * 100;
+
+  // 同步更新 USD 峰值（仅供 dashboard 显示）
+  const currentPrice = tokenState.currentPrice;
+  if (currentPrice && currentPrice > (position.peakPriceUsd ?? 0)) {
     tokenState.position.peakPriceUsd = currentPrice;
   }
-  const peakPriceUsd = tokenState.position.peakPriceUsd ?? currentPrice;
-  const peakPnlPct   = (peakPriceUsd - entryPriceUsd) / entryPriceUsd * 100;
+
+  // 更新 pnlPct 供 dashboard 显示
+  tokenState.pnlPct = pnlPct.toFixed(2);
 
   // ── 1. 硬止损 -25% ─────────────────────────────────────────
   if (pnlPct <= -STOP_LOSS_PCT) {
-    logger.warn(`[Trader] STOP-LOSS ${tokenState.symbol} PnL=${pnlPct.toFixed(1)}%`);
+    logger.warn(`[Trader] STOP-LOSS ${symbol} SOL_PnL=${pnlPct.toFixed(1)}%`);
     tokenState.position = await sell(tokenState, 1.0, `STOP_LOSS_${STOP_LOSS_PCT}%`);
     return 'EXIT';
   }
 
-  // ── 2. 移动止损（峰值涨幅 >= 30% 后激活，回撤 -30% 触发）──
-  // 激活后止损线 = peakPrice × (1 - TRAIL_PCT/100)
-  // 例：峰值 +50% 时止损线在 1.5×0.7 = 1.05 倍成本（接近保本）
-  //     峰值 +100% 时止损线在 2.0×0.7 = 1.40 倍成本（锁住40%）
-  //     峰值 +400% 时止损线在 5.0×0.7 = 3.50 倍成本（锁住大量利润）
+  // ── 2. 移动止损（SOL峰值涨幅 >= 30% 后激活）───────────────
   if (peakPnlPct >= TRAIL_ACTIVATE_PCT) {
-    const trailStop = peakPriceUsd * (1 - TRAIL_PCT / 100);
-    if (currentPrice <= trailStop) {
+    const trailStop = peakSolValue * (1 - TRAIL_PCT / 100);
+    if (currentSolLam <= trailStop) {
       logger.warn(
-        `[Trader] TRAIL-STOP ${tokenState.symbol}` +
+        `[Trader] TRAIL-STOP ${symbol}` +
         ` peak=+${peakPnlPct.toFixed(0)}%` +
-        ` trailStop=${trailStop.toExponential(3)}` +
         ` now=${pnlPct.toFixed(1)}%`
       );
       tokenState.position = await sell(tokenState, 1.0, `TRAIL_STOP_peak+${peakPnlPct.toFixed(0)}%`);
