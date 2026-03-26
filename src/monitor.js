@@ -74,6 +74,7 @@ class TokenMonitor {
       bought:       false,   // FDV通过且已下单买入
       exitSent:     false,
       inPosition:   false,
+      managing:     false,   // 防竞态：managePosition 执行中时为 true
     };
 
     this.tokens.set(address, state);
@@ -213,26 +214,29 @@ class TokenMonitor {
         }
 
         // ── 持仓中：每次拿到新价格立即检查止损/止盈 ──────────
-        if (state.inPosition && state.position && !state.exitSent) {
-          const action = await trader.managePosition(state);
+        if (state.inPosition && state.position && !state.exitSent && !state.managing) {
+          state.managing = true;   // 加锁，防止1秒内并发触发两次
+          try {
+            const action = await trader.managePosition(state);
 
-          if (action === 'EXIT') {
-            // 止损 / 移动止损 → 全仓清出，立即退出白名单
-            state.inPosition = false;
-            state.position   = null;
-            state.exitSent   = true;
-            this._addTradeLog({ type: 'EXIT', symbol: state.symbol, reason: 'stop_or_trail' });
-            setTimeout(() => this._removeToken(addr, 'STOP_OR_TRAIL'), 5000);
-
-          } else if (action === 'PARTIAL') {
-            this._addTradeLog({ type: 'PARTIAL_SELL', symbol: state.symbol });
-            // 分批卖出后若仓位已归零（不太可能但做保护）→ 退出白名单
-            if (!state.position || state.position.tokenBalance <= 0) {
+            if (action === 'EXIT') {
               state.inPosition = false;
               state.position   = null;
               state.exitSent   = true;
-              setTimeout(() => this._removeToken(addr, 'PARTIAL_FULLY_SOLD'), 5000);
+              this._addTradeLog({ type: 'EXIT', symbol: state.symbol, reason: 'stop_or_trail' });
+              setTimeout(() => this._removeToken(addr, 'STOP_OR_TRAIL'), 5000);
+
+            } else if (action === 'PARTIAL') {
+              this._addTradeLog({ type: 'PARTIAL_SELL', symbol: state.symbol });
+              if (!state.position || state.position.tokenBalance <= 0) {
+                state.inPosition = false;
+                state.position   = null;
+                state.exitSent   = true;
+                setTimeout(() => this._removeToken(addr, 'PARTIAL_FULLY_SOLD'), 5000);
+              }
             }
+          } finally {
+            state.managing = false;  // 无论成功失败都释放锁
           }
         }
       }
@@ -260,8 +264,8 @@ class TokenMonitor {
 
       if (!state.inPosition) continue;  // 不持仓无需死叉出场
 
-      // EMA 死叉出场
-      if (result.signal === 'SELL') {
+      // EMA 死叉出场（同样检查锁，避免和 _pollPrices 竞态）
+      if (result.signal === 'SELL' && !state.managing) {
         logger.warn(`[Strategy] EMA死叉 SELL ${state.symbol} — ${result.reason}`);
         await this._doExit(state, result.reason);
       }
