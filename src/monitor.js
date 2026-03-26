@@ -1,8 +1,8 @@
 // src/monitor.js — Core monitoring engine (Singleton)
 //
 // 买入策略：收录即买
-//   webhook 收到代币 → 查 FDV → $20,000 ≤ FDV ≤ $50,000 → 立即用 0.5 SOL 买入
-//   FDV 超出范围（未知、过低、过高）→ 静默拒绝，不再跟踪
+//   webhook 收到代币 → 查 FDV + LP → $20,000 ≤ FDV ≤ $50,000 且 LP ≥ $5,000 → 立即用 0.5 SOL 买入
+//   条件不满足 → 静默拒绝，不再跟踪
 //
 // 出场策略（EMA 只用于出场）：
 //   1. 硬止损    -25%
@@ -25,6 +25,7 @@ const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '300');
 const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '240');
 const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD           || '20000');
 const FDV_MAX_USD        = parseInt(process.env.FDV_MAX_USD           || '50000');
+const LP_MIN_USD         = parseInt(process.env.LP_MIN_USD            || '5000');
 const MAX_TICKS_HISTORY  = 60 * 60 * 3;  // 3h × 12 ticks/min = 2160 ticks max
 
 class TokenMonitor {
@@ -122,8 +123,19 @@ class TokenMonitor {
       return;
     }
 
-    // FDV 合格 → 立即买入
-    logger.warn(`[Monitor] ✅ ${state.symbol} FDV=$${state.fdv?.toLocaleString()} — 立即买入`);
+    // LP 门槛检查
+    if (state.lp === null || state.lp < LP_MIN_USD) {
+      const reason = state.lp === null
+        ? 'LP_UNKNOWN'
+        : `LP_TOO_LOW($${state.lp}<$${LP_MIN_USD})`;
+      logger.warn(`[Monitor] ⛔ ${state.symbol} rejected — ${reason}`);
+      state.exitSent = true;
+      setTimeout(() => this._removeToken(state.address, reason), 1000);
+      return;
+    }
+
+    // FDV + LP 均合格 → 立即买入
+    logger.warn(`[Monitor] ✅ ${state.symbol} FDV=$${state.fdv?.toLocaleString()} LP=$${state.lp?.toLocaleString()} — 立即买入`);
     const pos = await trader.buy(state);
     if (pos) {
       state.position   = pos;
