@@ -5,7 +5,7 @@
 //   • Anti-sandwich via Jito bundle tip + priority fee
 //   • Tiered TP: sells a fraction of holdings at each profit level
 //   • Hard stop-loss: -25% from entry
-//   • Trailing stop: 30% pullback from peak, activates once up 30%+
+//   • Trailing stop: 30% pullback from peak, activates once up 50%+
 //   • EMA death-cross: sells remainder of position
 
 'use strict';
@@ -46,7 +46,7 @@ const TP3_SELL  = parseFloat(process.env.TP3_SELL || '50');
 const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || '25');
 const TRAIL_PCT     = parseFloat(process.env.TRAIL_PCT     || '30');
 // 移动止损激活门槛：峰值涨幅超过此值后激活（默认30%）
-const TRAIL_ACTIVATE_PCT = parseFloat(process.env.TRAIL_ACTIVATE_PCT || '30');
+const TRAIL_ACTIVATE_PCT = parseFloat(process.env.TRAIL_ACTIVATE_PCT || '50');
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
