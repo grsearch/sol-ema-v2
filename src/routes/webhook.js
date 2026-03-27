@@ -6,16 +6,27 @@ const { TokenMonitor } = require('../monitor');
 
 /**
  * POST /webhook/add-token
- * Body: { "network": "solana", "address": "...", "symbol": "..." }
+ * Body: {
+ *   "network":   "solana",
+ *   "address":   "...",
+ *   "symbol":    "TOKEN",
+ *   "xMentions": 12,
+ *   "holders":   203,
+ *   "top10Pct":  "45.3%",
+ *   "devPct":    "8.1%"
+ * }
  */
 router.post('/add-token', async (req, res) => {
-  const { address, symbol, network } = req.body || {};
+  const { address, symbol, network, xMentions, holders, top10Pct, devPct } = req.body || {};
   if (!address) return res.status(400).json({ ok: false, error: 'Missing address' });
 
   logger.info(`[Webhook] Received: ${symbol || '?'} @ ${address}`);
 
   try {
-    const result = await TokenMonitor.getInstance().addToken({ address, symbol, network });
+    const result = await TokenMonitor.getInstance().addToken({
+      address, symbol, network,
+      xMentions, holders, top10Pct, devPct,
+    });
     return res.json({ ok: result.ok, reason: result.reason || null });
   } catch (e) {
     logger.warn(`[Webhook] addToken error: ${e.message}`);
