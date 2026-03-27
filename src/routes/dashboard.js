@@ -58,4 +58,9 @@ router.delete('/tokens/:address', async (req, res) => {
   res.json({ ok: true });
 });
 
+// GET /api/trade-records — 24h complete trade records for stats dashboard
+router.get('/trade-records', (req, res) => {
+  res.json(TokenMonitor.getInstance().getTradeRecords());
+});
+
 module.exports = router;
