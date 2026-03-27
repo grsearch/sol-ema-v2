@@ -384,13 +384,13 @@ class TokenMonitor {
   _finalizeTradeRecord(state, reason) {
     const rec = this.tradeRecords.find(r => r.id === state.address);
     if (!rec) return;
-    rec.exitAt      = Date.now();
-    rec.exitReason  = reason;
-    rec.exitFdv     = state.fdv;
-    rec.pnlPct      = state.pnlPct;
-    // solReceived 从 position 卖出记录里估算
-    if (state.position?.solSpent !== undefined) {
-      const pnl = parseFloat(state.pnlPct || '0') / 100;
+    rec.exitAt     = Date.now();
+    rec.exitReason = reason;
+    rec.exitFdv    = state.fdv;
+    rec.pnlPct     = state.pnlPct;
+    // 用 pnlPct 和买入SOL反推卖出SOL
+    if (state.pnlPct != null && rec.solSpent) {
+      const pnl = parseFloat(state.pnlPct) / 100;
       rec.solReceived = +(rec.solSpent * (1 + pnl)).toFixed(4);
     }
   }
