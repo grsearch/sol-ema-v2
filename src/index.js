@@ -12,6 +12,7 @@ const logger           = require('./logger');
 const webhookRouter    = require('./routes/webhook');
 const dashboardRouter  = require('./routes/dashboard');
 const { TokenMonitor } = require('./monitor');
+const { scheduleDaily, listReports } = require('./reporter');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -20,10 +21,19 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
+// 报告文件静态服务
+app.use('/reports', express.static(path.join(__dirname, '../public/reports')));
 
 // ── Routes ────────────────────────────────────────────────────
 app.use('/webhook', webhookRouter);
 app.use('/api',     dashboardRouter);
+
+// GET /api/reports — 报告列表
+app.get('/api/reports', (req, res) => res.json(listReports()));
+
+app.get('/stats', (req, res) => {
+  res.sendFile(path.join(__dirname, '../public/stats.html'));
+});
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));
@@ -45,7 +55,11 @@ wss.on('connection', (ws) => {
 global._wss = wss;
 
 // ── Start ─────────────────────────────────────────────────────
-TokenMonitor.getInstance().start();
+const monitor = TokenMonitor.getInstance();
+monitor.start();
+
+// 启动每日 08:00 报告定时器
+scheduleDaily(() => monitor.getTradeRecords());
 
 httpServer.listen(PORT, () => {
   logger.info(`🚀 SOL EMA Monitor v2  →  http://0.0.0.0:${PORT}`);
@@ -55,10 +69,10 @@ httpServer.listen(PORT, () => {
 // ── Graceful shutdown ─────────────────────────────────────────
 process.on('SIGTERM', async () => {
   logger.info('SIGTERM — shutting down');
-  TokenMonitor.getInstance().stop();
+  monitor.stop();
   httpServer.close(() => process.exit(0));
 });
 process.on('SIGINT', () => {
-  TokenMonitor.getInstance().stop();
+  monitor.stop();
   process.exit(0);
 });
