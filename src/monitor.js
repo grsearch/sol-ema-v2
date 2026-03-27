@@ -36,8 +36,9 @@ class TokenMonitor {
   }
 
   constructor() {
-    this.tokens     = new Map();   // Map<address, TokenState>
-    this.tradeLog   = [];          // last 200 trade entries
+    this.tokens      = new Map();   // Map<address, TokenState>
+    this.tradeLog    = [];          // last 200 trade entries (实时feed)
+    this.tradeRecords = [];         // 24h完整交易记录（用于统计dashboard）
     this._pollTimer  = null;
     this._klineTimer = null;
     this._metaTimer  = null;
@@ -46,7 +47,7 @@ class TokenMonitor {
   }
 
   // ── Add token to whitelist ──────────────────────────────────
-  async addToken({ address, symbol, network = 'solana' }) {
+  async addToken({ address, symbol, network = 'solana', xMentions, holders, top10Pct, devPct }) {
     if (this.tokens.has(address)) {
       logger.info(`[Monitor] Already in whitelist: ${symbol} (${address.slice(0, 8)})`);
       return { ok: false, reason: 'already_exists' };
@@ -66,16 +67,21 @@ class TokenMonitor {
       fdv:          null,
       lp:           null,
       age:          null,
+      // 扫描服务器发来的额外数据
+      xMentions:    xMentions ?? null,
+      holders:      holders   ?? null,
+      top10Pct:     top10Pct  ?? null,
+      devPct:       devPct    ?? null,
       // Position tracking (null = no open position)
       position:     null,
       pnlPct:       null,
       // EMA state（仅用于出场判断）
       bearishCount: 0,
       // Lifecycle flags
-      bought:       false,   // FDV通过且已下单买入
+      bought:       false,
       exitSent:     false,
       inPosition:   false,
-      managing:     false,   // 防竞态：managePosition 执行中时为 true
+      managing:     false,
     };
 
     this.tokens.set(address, state);
@@ -143,6 +149,9 @@ class TokenMonitor {
       state.bought     = true;
       state.lastSignal = 'BUY';
       this._addTradeLog({ type: 'BUY', symbol: state.symbol, reason: 'WHITELIST_IMMEDIATE' });
+
+      // 创建24h交易记录
+      this._createTradeRecord(state, pos);
     } else {
       // 买入失败（Jupiter 错误等）→ 不监控，移除
       logger.warn(`[Monitor] ⚠️  ${state.symbol} 买入失败，移除白名单`);
@@ -192,10 +201,12 @@ class TokenMonitor {
     this._dashTimer = setInterval(() => {
       broadcastToClients({ type: 'update', data: this.getDashboardData() });
     }, 5000);
+    // 每15分钟刷新交易记录里的 currentFdv
+    this._fdvTimer  = setInterval(() => this._refreshTradeRecordFdv(), 15 * 60 * 1000);
   }
 
   stop() {
-    [this._pollTimer, this._klineTimer, this._metaTimer, this._ageTimer, this._dashTimer]
+    [this._pollTimer, this._klineTimer, this._metaTimer, this._ageTimer, this._dashTimer, this._fdvTimer]
       .forEach(t => t && clearInterval(t));
     logger.info('[Monitor] Stopped');
   }
@@ -236,6 +247,7 @@ class TokenMonitor {
               state.position   = null;
               state.exitSent   = true;
               this._addTradeLog({ type: 'EXIT', symbol: state.symbol, reason: 'stop_or_trail' });
+              this._finalizeTradeRecord(state, 'stop_or_trail');
               setTimeout(() => this._removeToken(addr, 'STOP_OR_TRAIL'), 5000);
 
             } else if (action === 'PARTIAL') {
@@ -292,6 +304,7 @@ class TokenMonitor {
     state.lastSignal = 'SELL';
     state.exitSent   = true;
     this._addTradeLog({ type: 'SELL', symbol: state.symbol, reason });
+    this._finalizeTradeRecord(state, reason);
     setTimeout(() => this._removeToken(state.address, reason), 5000);
   }
 
@@ -315,6 +328,7 @@ class TokenMonitor {
         state.inPosition = false;
         state.position   = null;
         this._addTradeLog({ type: 'SELL', symbol: state.symbol, reason: 'AGE_EXPIRY' });
+        this._finalizeTradeRecord(state, 'AGE_EXPIRY');
         setTimeout(() => this._removeToken(addr, 'AGE_EXPIRY'), 5000);
       } else {
         logger.info(`[Monitor] ⏰ Age expiry (no position): ${state.symbol}`);
@@ -330,6 +344,76 @@ class TokenMonitor {
       this.tokens.delete(addr);
       broadcastToClients({ type: 'token_removed', data: { address: addr, reason } });
     }
+  }
+
+  // ── 24h 交易记录 ──────────────────────────────────────────────
+  _createTradeRecord(state, pos) {
+    const rec = {
+      id:          state.address,
+      address:     state.address,
+      symbol:      state.symbol,
+      buyAt:       Date.now(),
+      // 买入时的链上数据
+      entryFdv:    state.fdv,
+      entryLp:     state.lp,
+      entryLpFdv:  state.fdv ? +((state.lp / state.fdv) * 100).toFixed(1) : null,
+      // 扫描服务器发来的数据
+      xMentions:   state.xMentions,
+      holders:     state.holders,
+      top10Pct:    state.top10Pct,
+      devPct:      state.devPct,
+      // 买入信息
+      solSpent:    pos.solSpent,
+      entryPrice:  pos.entryPriceUsd,
+      // 退出信息（待填）
+      exitAt:      null,
+      exitReason:  null,
+      exitFdv:     null,
+      solReceived: null,
+      pnlPct:      null,
+      // 当前FDV（15分钟更新）
+      currentFdv:  state.fdv,
+      fdvUpdatedAt: Date.now(),
+    };
+    this.tradeRecords.unshift(rec);
+    // 只保留 24h 内的记录
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    this.tradeRecords = this.tradeRecords.filter(r => r.buyAt > cutoff);
+  }
+
+  _finalizeTradeRecord(state, reason) {
+    const rec = this.tradeRecords.find(r => r.id === state.address);
+    if (!rec) return;
+    rec.exitAt      = Date.now();
+    rec.exitReason  = reason;
+    rec.exitFdv     = state.fdv;
+    rec.pnlPct      = state.pnlPct;
+    // solReceived 从 position 卖出记录里估算
+    if (state.position?.solSpent !== undefined) {
+      const pnl = parseFloat(state.pnlPct || '0') / 100;
+      rec.solReceived = +(rec.solSpent * (1 + pnl)).toFixed(4);
+    }
+  }
+
+  // 每15分钟更新一次 currentFdv
+  async _refreshTradeRecordFdv() {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    this.tradeRecords = this.tradeRecords.filter(r => r.buyAt > cutoff);
+    for (const rec of this.tradeRecords) {
+      try {
+        const overview = await birdeye.getTokenOverview(rec.address);
+        if (overview) {
+          rec.currentFdv   = overview.fdv ?? overview.mc ?? rec.currentFdv;
+          rec.fdvUpdatedAt = Date.now();
+        }
+      } catch (_) {}
+      await sleep(200);
+    }
+  }
+
+  getTradeRecords() {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    return this.tradeRecords.filter(r => r.buyAt > cutoff);
   }
 
   _addTradeLog(entry) {
