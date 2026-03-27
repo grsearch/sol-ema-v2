@@ -212,9 +212,11 @@ function render() {
     const isOpen   = !r.exitAt;
     const pnl      = parseFloat(r.pnlPct || '0');
     const rowClass = isOpen ? 'open' : (pnl >= 0 ? 'win' : 'loss');
-    const pnlSol   = r.solReceived != null
+    const pnlSol = r.solReceived != null
       ? (r.solReceived - r.solSpent).toFixed(3)
-      : null;
+      : (r.pnlPct != null && r.solSpent)
+        ? (r.solSpent * parseFloat(r.pnlPct) / 100).toFixed(3)
+        : null;
     const addrShort = r.address.slice(0,6) + '...' + r.address.slice(-4);
     const gmgnUrl   = `https://gmgn.ai/sol/token/${r.address}`;
 
@@ -246,6 +248,9 @@ function updateSummary() {
 
   const netSol = closed.reduce((acc, r) => {
     if (r.solReceived != null) return acc + (r.solReceived - r.solSpent);
+    if (r.pnlPct != null && r.solSpent) {
+      return acc + r.solSpent * parseFloat(r.pnlPct) / 100;
+    }
     return acc;
   }, 0);
 
