@@ -48,6 +48,11 @@ router.delete('/tokens/:address', async (req, res) => {
 
   if (state.inPosition && state.position && !state.exitSent) {
     await trader.exitPosition(state, 'MANUAL_REMOVE');
+    state.inPosition = false;
+    state.position   = null;
+    state.lastSignal = 'SELL';
+    // ← 修复：写入退出信息，stats 页面不再显示"持仓中"
+    monitor._finalizeTradeRecord(state, 'MANUAL_REMOVE');
     monitor._addTradeLog({ type: 'SELL', symbol: state.symbol, reason: 'MANUAL_REMOVE' });
   }
 
