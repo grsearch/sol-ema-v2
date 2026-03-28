@@ -3,10 +3,11 @@
 // Architecture:
 //   • Uses Jupiter Ultra API (Pro I) for swap quote + execute
 //   • Anti-sandwich via Jito bundle tip + priority fee
-//   • Tiered TP: DISABLED (set TP_ENABLED=false to re-enable)
+//   • Tiered TP: DISABLED (set TP_ENABLED=true to re-enable)
 //   • Hard stop-loss: -50% from entry
 //   • Trailing stop: 30% pullback from peak, activates once up 50%+
 //   • EMA death-cross: sells remainder of position
+//   • Dynamic slippage retry: each retry widens slippage ×1.5, max 2000 bps
 
 'use strict';
 
@@ -20,33 +21,30 @@ const logger = require('./logger');
 const { broadcastToClients } = require('./wsHub');
 
 // ── Config ─────────────────────────────────────────────────────
-const HELIUS_RPC      = process.env.HELIUS_RPC_URL       || '';
-const JUP_API         = process.env.JUPITER_API_URL      || 'https://api.jup.ag';
-const JUP_API_KEY     = process.env.JUPITER_API_KEY      || '';   // Pro I key
-const SLIPPAGE_BPS    = parseInt(process.env.SLIPPAGE_BPS            || '300');
-const USE_JITO        = process.env.USE_JITO === 'true';
-const JITO_TIP        = parseInt(process.env.JITO_TIP_LAMPORTS       || '1000000');
-const PRIORITY_FEE    = parseInt(process.env.PRIORITY_FEE_MICROLAMPORTS || '100000');
-const TRADE_SOL       = parseFloat(process.env.TRADE_SIZE_SOL        || '0.5');
+const HELIUS_RPC   = process.env.HELIUS_RPC_URL            || '';
+const JUP_API      = process.env.JUPITER_API_URL           || 'https://api.jup.ag';
+const JUP_API_KEY  = process.env.JUPITER_API_KEY           || '';
+const SLIPPAGE_BPS = parseInt(process.env.SLIPPAGE_BPS     || '500');  // ← 默认 5%
+const TRADE_SOL    = parseFloat(process.env.TRADE_SIZE_SOL || '0.5');
 
-// Jupiter Pro I 请求头 — 有 Key 就带上，提升速率限制
+// 动态滑点上限：重试时最多放宽到 20%
+const SLIPPAGE_MAX_BPS = 2000;
+
 function jupHeaders() {
   return JUP_API_KEY ? { 'x-api-key': JUP_API_KEY } : {};
 }
 
-// Take-profit levels（暂停：设 TP_ENABLED=true 可重新启用）
-const TP_ENABLED = process.env.TP_ENABLED === 'true';   // ← 默认关闭
-const TP1_PCT   = parseFloat(process.env.TP1_PCT  || '100');
-const TP1_SELL  = parseFloat(process.env.TP1_SELL || '33');
-const TP2_PCT   = parseFloat(process.env.TP2_PCT  || '200');
-const TP2_SELL  = parseFloat(process.env.TP2_SELL || '33');
-const TP3_PCT   = parseFloat(process.env.TP3_PCT  || '400');
-const TP3_SELL  = parseFloat(process.env.TP3_SELL || '50');
-// TP4: EMA death-cross triggers full remainder exit
+// Take-profit（暂停：TP_ENABLED=true 可重新启用）
+const TP_ENABLED = process.env.TP_ENABLED === 'true';
+const TP1_PCT    = parseFloat(process.env.TP1_PCT  || '100');
+const TP1_SELL   = parseFloat(process.env.TP1_SELL || '33');
+const TP2_PCT    = parseFloat(process.env.TP2_PCT  || '200');
+const TP2_SELL   = parseFloat(process.env.TP2_SELL || '33');
+const TP3_PCT    = parseFloat(process.env.TP3_PCT  || '400');
+const TP3_SELL   = parseFloat(process.env.TP3_SELL || '50');
 
-const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || '50');   // ← 改为 -50%
-const TRAIL_PCT     = parseFloat(process.env.TRAIL_PCT     || '30');
-// 移动止损激活门槛：峰值涨幅超过此值后激活（默认50%）
+const STOP_LOSS_PCT      = parseFloat(process.env.STOP_LOSS_PCT      || '50');
+const TRAIL_PCT          = parseFloat(process.env.TRAIL_PCT          || '30');
 const TRAIL_ACTIVATE_PCT = parseFloat(process.env.TRAIL_ACTIVATE_PCT || '50');
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -71,6 +69,11 @@ function getConn() {
 }
 
 // ── Jupiter helpers ────────────────────────────────────────────
+
+/**
+ * Fetch a Jupiter Ultra swap order.
+ * slippageBps 显式传入，供动态重试逻辑使用。
+ */
 async function getSwapOrder({ inputMint, outputMint, amount, slippageBps }) {
   const url = `${JUP_API}/ultra/v1/order`;
   const { data } = await axios.get(url, {
@@ -89,10 +92,7 @@ async function getSwapOrder({ inputMint, outputMint, amount, slippageBps }) {
 
 async function executeSwapOrder({ requestId, signedTransaction }) {
   const url = `${JUP_API}/ultra/v1/execute`;
-  const { data } = await axios.post(url, {
-    requestId,
-    signedTransaction,
-  }, {
+  const { data } = await axios.post(url, { requestId, signedTransaction }, {
     headers: jupHeaders(),
     timeout: 30000,
   });
@@ -107,64 +107,86 @@ function signTx(base64Tx) {
   return Buffer.from(tx.serialize()).toString('base64');
 }
 
-// ── Get token balance (in raw units) ──────────────────────────
+// ── Token balance ──────────────────────────────────────────────
 async function getTokenBalance(mintAddress) {
   const conn = getConn();
   const kp   = getKeypair();
-
-  if (mintAddress === SOL_MINT) {
-    const bal = await conn.getBalance(kp.publicKey);
-    return bal;
-  }
-
+  if (mintAddress === SOL_MINT) return conn.getBalance(kp.publicKey);
   const mint = new PublicKey(mintAddress);
   const { value } = await conn.getParsedTokenAccountsByOwner(kp.publicKey, { mint });
   if (!value.length) return 0;
   return parseInt(value[0].account.data.parsed.info.tokenAmount.amount || '0');
 }
 
-async function buildBuyOrder(tokenMint, solAmountLamports) {
+// ── Order builders（接受显式 slippageBps，供重试时递增）─────────
+
+async function buildBuyOrder(tokenMint, solAmountLamports, slippageBps) {
   return getSwapOrder({
-    inputMint:  SOL_MINT,
-    outputMint: tokenMint,
-    amount:     solAmountLamports,
+    inputMint:   SOL_MINT,
+    outputMint:  tokenMint,
+    amount:      solAmountLamports,
+    slippageBps: slippageBps ?? SLIPPAGE_BPS,
   });
 }
 
-async function buildSellOrder(tokenMint, tokenAmount) {
+async function buildSellOrder(tokenMint, tokenAmount, slippageBps) {
+  // 卖出滑点 = 传入值的 2 倍，确保止损单能成交，但不超过 SLIPPAGE_MAX_BPS
+  const base = slippageBps ?? SLIPPAGE_BPS;
   return getSwapOrder({
-    inputMint:  tokenMint,
-    outputMint: SOL_MINT,
-    amount:     tokenAmount,
-    slippageBps: Math.min(SLIPPAGE_BPS * 2, 1000),
+    inputMint:   tokenMint,
+    outputMint:  SOL_MINT,
+    amount:      tokenAmount,
+    slippageBps: Math.min(base * 2, SLIPPAGE_MAX_BPS),
   });
 }
 
-// ── Execute with retry ─────────────────────────────────────────
-async function executeWithRetry(order, retries = 3) {
-  const txBase64 = order.transaction;
-  if (!txBase64) {
-    throw new Error(`Jupiter order missing transaction field. Response keys: ${Object.keys(order).join(', ')}`);
-  }
+// ── Dynamic-slippage retry ─────────────────────────────────────
+//
+// orderFn: (slippageBps: number) => Promise<JupiterOrder>
+//   每次重试都重新拉报价（价格更新鲜），并将滑点 ×1.5，
+//   上限为 SLIPPAGE_MAX_BPS（20%）。
+//
+// 首次:   SLIPPAGE_BPS        (5%  = 500)
+// 重试1:  min(500×1.5, 2000)  (7.5% = 750)
+// 重试2:  min(750×1.5, 2000)  (11.25% → 1125)
+async function executeWithRetry(orderFn, retries = 3) {
+  let slippage = SLIPPAGE_BPS;
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      const order    = await orderFn(slippage);
+      const txBase64 = order.transaction;
+      if (!txBase64) {
+        throw new Error(
+          `Jupiter order missing 'transaction' field. Keys: ${Object.keys(order).join(', ')}`
+        );
+      }
+
       const signed = signTx(txBase64);
       const result = await executeSwapOrder({
         requestId:         order.requestId,
         signedTransaction: signed,
       });
+
       if (result.status === 'Success') return result;
-      logger.warn(`[Trader] Swap status ${result.status} (attempt ${attempt})`);
+      logger.warn(
+        `[Trader] Swap status="${result.status}" attempt=${attempt} slippage=${slippage}bps`
+      );
     } catch (e) {
-      logger.warn(`[Trader] Execute attempt ${attempt} failed: ${e.message}`);
+      logger.warn(
+        `[Trader] Execute attempt=${attempt} slippage=${slippage}bps error: ${e.message}`
+      );
     }
+
+    // 加宽滑点，等待后重试
+    slippage = Math.min(Math.floor(slippage * 1.5), SLIPPAGE_MAX_BPS);
     if (attempt < retries) await sleep(1500 * attempt);
   }
-  throw new Error('Swap failed after retries');
+
+  throw new Error(`Swap failed after ${retries} retries`);
 }
 
-// ── Main: BUY ──────────────────────────────────────────────────
+// ── BUY ────────────────────────────────────────────────────────
 async function buy(tokenState) {
   const { address, symbol, currentPrice } = tokenState;
   logger.warn(`[Trader] BUY ${symbol} @ Birdeye=${currentPrice}`);
@@ -172,12 +194,14 @@ async function buy(tokenState) {
   const solLamports = Math.floor(TRADE_SOL * LAMPORTS_PER_SOL);
 
   try {
-    const order  = await buildBuyOrder(address, solLamports);
-    const result = await executeWithRetry(order);
+    const result = await executeWithRetry(
+      (slipBps) => buildBuyOrder(address, solLamports, slipBps)
+    );
 
     const tokenBalance     = parseInt(result.outputAmountResult || '0');
     const solSpentLamports = parseInt(result.inputAmountResult  || String(solLamports));
 
+    // 买入完成后重拉价格作为开仓基准，避免执行耗时导致止损基准偏移
     let entryPriceUsd = currentPrice;
     try {
       const freshPrice = await require('./birdeye').getPrice(address);
@@ -186,7 +210,7 @@ async function buy(tokenState) {
         logger.warn(`[Trader] Entry price refreshed: ${currentPrice} → ${freshPrice}`);
       }
     } catch (_) {
-      logger.warn(`[Trader] Entry price refresh failed, using pre-buy price`);
+      logger.warn('[Trader] Entry price refresh failed, using pre-buy price');
     }
 
     logger.warn(
@@ -215,7 +239,7 @@ async function buy(tokenState) {
   }
 }
 
-// ── Main: SELL (partial or full) ──────────────────────────────
+// ── SELL (partial or full) ─────────────────────────────────────
 async function sell(tokenState, fraction, reason) {
   const { address, symbol, currentPrice, position } = tokenState;
   if (!position || position.tokenBalance <= 0) return null;
@@ -226,30 +250,36 @@ async function sell(tokenState, fraction, reason) {
   logger.warn(`[Trader] SELL ${(fraction * 100).toFixed(0)}% ${symbol} (${reason}) @ ${currentPrice}`);
 
   try {
-    const order  = await buildSellOrder(address, rawSellAmount);
-    const result = await executeWithRetry(order);
+    const result = await executeWithRetry(
+      (slipBps) => buildSellOrder(address, rawSellAmount, slipBps)
+    );
 
     const solReceived = parseInt(result.outputAmountResult || '0') / LAMPORTS_PER_SOL;
     const newBalance  = position.tokenBalance - rawSellAmount;
 
-    logger.warn(`[Trader] SELL OK ${symbol} | sig=${result.signature?.slice(0,12)} | received=${solReceived.toFixed(4)} SOL | remaining=${newBalance}`);
+    logger.warn(
+      `[Trader] SELL OK ${symbol}` +
+      ` | sig=${result.signature?.slice(0, 12)}` +
+      ` | received=${solReceived.toFixed(4)} SOL` +
+      ` | remaining=${newBalance}`
+    );
     _broadcastTrade('SELL', symbol, address, currentPrice, solReceived, result.signature, reason);
 
     if (newBalance <= 0) return null;
     return { ...position, tokenBalance: newBalance };
   } catch (e) {
     logger.warn(`[Trader] SELL FAILED ${symbol}: ${e.message}`);
-    return position;
+    return position;  // 保持原仓位，下次 tick 重试
   }
 }
 
-// ── Position manager — called every price tick (1s) ───────────
+// ── Position manager（每秒调用）────────────────────────────────
 //
 // 出场优先级：
-//   1. 硬止损      -50%  (STOP_LOSS_PCT)
-//   2. 移动止损    峰值涨幅 >= 50% 后激活，峰值回撤 -30% → 出场
-//   3. 分批止盈    TP1/TP2/TP3（暂停，TP_ENABLED=false）
-// Returns 'HOLD' | 'PARTIAL' | 'EXIT'
+//   1. 硬止损      -50%
+//   2. 移动止损    峰值涨幅 ≥ 50% 激活，峰值回撤 -30% 触发
+//   3. 分批止盈    暂停（TP_ENABLED=false）
+// Returns: 'HOLD' | 'PARTIAL' | 'EXIT' | 'NONE'
 async function managePosition(tokenState) {
   const { currentPrice, position, symbol } = tokenState;
   if (!position || position.tokenBalance <= 0) return 'NONE';
@@ -274,7 +304,7 @@ async function managePosition(tokenState) {
     return 'EXIT';
   }
 
-  // ── 2. 移动止损（峰值涨幅 >= TRAIL_ACTIVATE_PCT 后激活）─────
+  // ── 2. 移动止损 ────────────────────────────────────────────
   if (peakPnlPct >= TRAIL_ACTIVATE_PCT) {
     const trailStop = peakPriceUsd * (1 - TRAIL_PCT / 100);
     if (currentPrice <= trailStop) {
@@ -289,7 +319,7 @@ async function managePosition(tokenState) {
     }
   }
 
-  // ── 3. 分批止盈 TP1/TP2/TP3（暂停中，TP_ENABLED=false）─────
+  // ── 3. 分批止盈（暂停中，TP_ENABLED=false）─────────────────
   if (TP_ENABLED) {
     let acted = false;
 
