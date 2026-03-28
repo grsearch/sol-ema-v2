@@ -4,7 +4,7 @@
 //   • Uses Jupiter Ultra API (Pro I) for swap quote + execute
 //   • Anti-sandwich via Jito bundle tip + priority fee
 //   • Tiered TP: DISABLED (set TP_ENABLED=true to re-enable)
-//   • Hard stop-loss: -50% from entry
+//   • Hard stop-loss: -25% from entry
 //   • Trailing stop: 30% pullback from peak, activates once up 50%+
 //   • EMA death-cross: sells remainder of position
 //   • Dynamic slippage retry: each retry widens slippage ×1.5, max 2000 bps
@@ -43,7 +43,7 @@ const TP2_SELL   = parseFloat(process.env.TP2_SELL || '33');
 const TP3_PCT    = parseFloat(process.env.TP3_PCT  || '400');
 const TP3_SELL   = parseFloat(process.env.TP3_SELL || '50');
 
-const STOP_LOSS_PCT      = parseFloat(process.env.STOP_LOSS_PCT      || '50');
+const STOP_LOSS_PCT      = parseFloat(process.env.STOP_LOSS_PCT      || '25');
 const TRAIL_PCT          = parseFloat(process.env.TRAIL_PCT          || '30');
 const TRAIL_ACTIVATE_PCT = parseFloat(process.env.TRAIL_ACTIVATE_PCT || '50');
 
