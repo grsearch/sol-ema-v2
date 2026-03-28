@@ -3,8 +3,8 @@
 // Architecture:
 //   • Uses Jupiter Ultra API (Pro I) for swap quote + execute
 //   • Anti-sandwich via Jito bundle tip + priority fee
-//   • Tiered TP: sells a fraction of holdings at each profit level
-//   • Hard stop-loss: -30% from entry
+//   • Tiered TP: DISABLED (set TP_ENABLED=false to re-enable)
+//   • Hard stop-loss: -50% from entry
 //   • Trailing stop: 30% pullback from peak, activates once up 50%+
 //   • EMA death-cross: sells remainder of position
 
@@ -34,18 +34,19 @@ function jupHeaders() {
   return JUP_API_KEY ? { 'x-api-key': JUP_API_KEY } : {};
 }
 
-// Take-profit levels
-const TP1_PCT   = parseFloat(process.env.TP1_PCT  || '100');   // +100%
-const TP1_SELL  = parseFloat(process.env.TP1_SELL || '33');    // sell 33%
+// Take-profit levels（暂停：设 TP_ENABLED=true 可重新启用）
+const TP_ENABLED = process.env.TP_ENABLED === 'true';   // ← 默认关闭
+const TP1_PCT   = parseFloat(process.env.TP1_PCT  || '100');
+const TP1_SELL  = parseFloat(process.env.TP1_SELL || '33');
 const TP2_PCT   = parseFloat(process.env.TP2_PCT  || '200');
 const TP2_SELL  = parseFloat(process.env.TP2_SELL || '33');
 const TP3_PCT   = parseFloat(process.env.TP3_PCT  || '400');
 const TP3_SELL  = parseFloat(process.env.TP3_SELL || '50');
 // TP4: EMA death-cross triggers full remainder exit
 
-const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || '25');
+const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || '50');   // ← 改为 -50%
 const TRAIL_PCT     = parseFloat(process.env.TRAIL_PCT     || '30');
-// 移动止损激活门槛：峰值涨幅超过此值后激活（默认30%）
+// 移动止损激活门槛：峰值涨幅超过此值后激活（默认50%）
 const TRAIL_ACTIVATE_PCT = parseFloat(process.env.TRAIL_ACTIVATE_PCT || '50');
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -70,10 +71,6 @@ function getConn() {
 }
 
 // ── Jupiter helpers ────────────────────────────────────────────
-/**
- * Get a Jupiter Ultra swap order (Pro I endpoint).
- * Ultra mode auto-selects best route and handles token accounts.
- */
 async function getSwapOrder({ inputMint, outputMint, amount, slippageBps }) {
   const url = `${JUP_API}/ultra/v1/order`;
   const { data } = await axios.get(url, {
@@ -90,10 +87,6 @@ async function getSwapOrder({ inputMint, outputMint, amount, slippageBps }) {
   return data;
 }
 
-/**
- * Execute a Jupiter Ultra swap order.
- * Returns { signature, inputAmount, outputAmount }.
- */
 async function executeSwapOrder({ requestId, signedTransaction }) {
   const url = `${JUP_API}/ultra/v1/execute`;
   const { data } = await axios.post(url, {
@@ -106,9 +99,6 @@ async function executeSwapOrder({ requestId, signedTransaction }) {
   return data;
 }
 
-/**
- * Sign a base64 VersionedTransaction and return base64 signed bytes.
- */
 function signTx(base64Tx) {
   const kp  = getKeypair();
   const buf = Buffer.from(base64Tx, 'base64');
@@ -122,10 +112,9 @@ async function getTokenBalance(mintAddress) {
   const conn = getConn();
   const kp   = getKeypair();
 
-  // Native SOL
   if (mintAddress === SOL_MINT) {
     const bal = await conn.getBalance(kp.publicKey);
-    return bal;  // lamports
+    return bal;
   }
 
   const mint = new PublicKey(mintAddress);
@@ -134,9 +123,6 @@ async function getTokenBalance(mintAddress) {
   return parseInt(value[0].account.data.parsed.info.tokenAmount.amount || '0');
 }
 
-// ── Build Jito-aware swap (priority fee + tip instruction) ─────
-// Jupiter Ultra already handles priority fees via the API params.
-// We pass computeUnitPriceMicroLamports to request higher priority.
 async function buildBuyOrder(tokenMint, solAmountLamports) {
   return getSwapOrder({
     inputMint:  SOL_MINT,
@@ -150,14 +136,12 @@ async function buildSellOrder(tokenMint, tokenAmount) {
     inputMint:  tokenMint,
     outputMint: SOL_MINT,
     amount:     tokenAmount,
-    // Slightly wider slippage on exit to guarantee fill
     slippageBps: Math.min(SLIPPAGE_BPS * 2, 1000),
   });
 }
 
 // ── Execute with retry ─────────────────────────────────────────
 async function executeWithRetry(order, retries = 3) {
-  // Jupiter Ultra API 返回字段是 "transaction"，不是 "swapTransaction"
   const txBase64 = order.transaction;
   if (!txBase64) {
     throw new Error(`Jupiter order missing transaction field. Response keys: ${Object.keys(order).join(', ')}`);
@@ -181,10 +165,6 @@ async function executeWithRetry(order, retries = 3) {
 }
 
 // ── Main: BUY ──────────────────────────────────────────────────
-/**
- * Buy `TRADE_SIZE_SOL` worth of `tokenMint`.
- * Returns position object: { entryPrice, tokenBalance, solSpent, tpHit }
- */
 async function buy(tokenState) {
   const { address, symbol, currentPrice } = tokenState;
   logger.warn(`[Trader] BUY ${symbol} @ Birdeye=${currentPrice}`);
@@ -198,9 +178,6 @@ async function buy(tokenState) {
     const tokenBalance     = parseInt(result.outputAmountResult || '0');
     const solSpentLamports = parseInt(result.inputAmountResult  || String(solLamports));
 
-    // ── 买入完成后立刻重新拉 Birdeye 价格作为开仓基准 ──────────
-    // execute 需要3-10秒，期间价格可能已变化，用旧价格会导致止损误判
-    // 用 execute 完成后的最新价，误差在1秒内，足够准确
     let entryPriceUsd = currentPrice;
     try {
       const freshPrice = await require('./birdeye').getPrice(address);
@@ -226,7 +203,7 @@ async function buy(tokenState) {
       solSpent:       solSpentLamports / LAMPORTS_PER_SOL,
       tpHit:          [],
       txBuy:          result.signature,
-      entryPriceUsd,    // execute完成后重新拉的Birdeye价，止损基准
+      entryPriceUsd,
       peakPriceUsd:   entryPriceUsd,
     };
 
@@ -239,10 +216,6 @@ async function buy(tokenState) {
 }
 
 // ── Main: SELL (partial or full) ──────────────────────────────
-/**
- * Sell `fraction` (0–1) of the remaining token balance.
- * Returns updated position (or null if fully exited).
- */
 async function sell(tokenState, fraction, reason) {
   const { address, symbol, currentPrice, position } = tokenState;
   if (!position || position.tokenBalance <= 0) return null;
@@ -262,28 +235,21 @@ async function sell(tokenState, fraction, reason) {
     logger.warn(`[Trader] SELL OK ${symbol} | sig=${result.signature?.slice(0,12)} | received=${solReceived.toFixed(4)} SOL | remaining=${newBalance}`);
     _broadcastTrade('SELL', symbol, address, currentPrice, solReceived, result.signature, reason);
 
-    if (newBalance <= 0) return null;  // fully exited
+    if (newBalance <= 0) return null;
     return { ...position, tokenBalance: newBalance };
   } catch (e) {
     logger.warn(`[Trader] SELL FAILED ${symbol}: ${e.message}`);
-    return position;  // unchanged on failure — will retry next cycle
+    return position;
   }
 }
 
 // ── Position manager — called every price tick (1s) ───────────
-/**
- * 止损止盈全部基于 Birdeye USD 价格：
- *   pnlPct = (currentPrice - entryPriceUsd) / entryPriceUsd × 100
- *
- * 不用 Jupiter 报价的原因：新币流动性浅，报价滑点极大，
- * 会导致"价格没跌但报价显示亏损"的假止损。
- *
- * 出场优先级：
- *   1. 硬止损      -25%
- *   2. 移动止损    峰值涨幅 >= 50% 后激活，峰值回撤 -30% → 出场
- *   3. 分批止盈    TP1/TP2/TP3
- * Returns 'HOLD' | 'PARTIAL' | 'EXIT'
- */
+//
+// 出场优先级：
+//   1. 硬止损      -50%  (STOP_LOSS_PCT)
+//   2. 移动止损    峰值涨幅 >= 50% 后激活，峰值回撤 -30% → 出场
+//   3. 分批止盈    TP1/TP2/TP3（暂停，TP_ENABLED=false）
+// Returns 'HOLD' | 'PARTIAL' | 'EXIT'
 async function managePosition(tokenState) {
   const { currentPrice, position, symbol } = tokenState;
   if (!position || position.tokenBalance <= 0) return 'NONE';
@@ -293,24 +259,22 @@ async function managePosition(tokenState) {
 
   const pnlPct = (currentPrice - entryPriceUsd) / entryPriceUsd * 100;
 
-  // 更新峰值 USD 价格
   if (currentPrice > (position.peakPriceUsd ?? 0)) {
     tokenState.position.peakPriceUsd = currentPrice;
   }
   const peakPriceUsd = tokenState.position.peakPriceUsd;
   const peakPnlPct   = (peakPriceUsd - entryPriceUsd) / entryPriceUsd * 100;
 
-  // 更新 dashboard 显示
   tokenState.pnlPct = pnlPct.toFixed(2);
 
-  // ── 1. 硬止损 -25% ─────────────────────────────────────────
+  // ── 1. 硬止损 -50% ─────────────────────────────────────────
   if (pnlPct <= -STOP_LOSS_PCT) {
     logger.warn(`[Trader] STOP-LOSS ${symbol} PnL=${pnlPct.toFixed(1)}%`);
     tokenState.position = await sell(tokenState, 1.0, `STOP_LOSS_${STOP_LOSS_PCT}%`);
     return 'EXIT';
   }
 
-  // ── 2. 移动止损（峰值涨幅 >= 50% 后激活，回撤 -30% 触发）──
+  // ── 2. 移动止损（峰值涨幅 >= TRAIL_ACTIVATE_PCT 后激活）─────
   if (peakPnlPct >= TRAIL_ACTIVATE_PCT) {
     const trailStop = peakPriceUsd * (1 - TRAIL_PCT / 100);
     if (currentPrice <= trailStop) {
@@ -325,25 +289,29 @@ async function managePosition(tokenState) {
     }
   }
 
-  // ── 3. 分批止盈 TP1/TP2/TP3 ────────────────────────────────
-  let acted = false;
+  // ── 3. 分批止盈 TP1/TP2/TP3（暂停中，TP_ENABLED=false）─────
+  if (TP_ENABLED) {
+    let acted = false;
 
-  if (!position.tpHit.includes('TP1') && pnlPct >= TP1_PCT) {
-    tokenState.position.tpHit.push('TP1');
-    tokenState.position = await sell(tokenState, TP1_SELL / 100, `TP1_+${TP1_PCT}%`);
-    acted = true;
-  } else if (!position.tpHit.includes('TP2') && pnlPct >= TP2_PCT) {
-    tokenState.position.tpHit.push('TP2');
-    tokenState.position = await sell(tokenState, TP2_SELL / 100, `TP2_+${TP2_PCT}%`);
-    acted = true;
-  } else if (!position.tpHit.includes('TP3') && pnlPct >= TP3_PCT) {
-    tokenState.position.tpHit.push('TP3');
-    tokenState.position = await sell(tokenState, TP3_SELL / 100, `TP3_+${TP3_PCT}%`);
-    acted = true;
+    if (!position.tpHit.includes('TP1') && pnlPct >= TP1_PCT) {
+      tokenState.position.tpHit.push('TP1');
+      tokenState.position = await sell(tokenState, TP1_SELL / 100, `TP1_+${TP1_PCT}%`);
+      acted = true;
+    } else if (!position.tpHit.includes('TP2') && pnlPct >= TP2_PCT) {
+      tokenState.position.tpHit.push('TP2');
+      tokenState.position = await sell(tokenState, TP2_SELL / 100, `TP2_+${TP2_PCT}%`);
+      acted = true;
+    } else if (!position.tpHit.includes('TP3') && pnlPct >= TP3_PCT) {
+      tokenState.position.tpHit.push('TP3');
+      tokenState.position = await sell(tokenState, TP3_SELL / 100, `TP3_+${TP3_PCT}%`);
+      acted = true;
+    }
+
+    if (!tokenState.position || tokenState.position.tokenBalance <= 0) return 'EXIT';
+    return acted ? 'PARTIAL' : 'HOLD';
   }
 
-  if (!tokenState.position || tokenState.position.tokenBalance <= 0) return 'EXIT';
-  return acted ? 'PARTIAL' : 'HOLD';
+  return 'HOLD';
 }
 
 // ── EMA death-cross exit ───────────────────────────────────────
