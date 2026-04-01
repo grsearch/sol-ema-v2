@@ -1,7 +1,7 @@
 // src/monitor.js — Core monitoring engine (Singleton)
 //
 // 买入策略：收录即买
-//   webhook 收到代币 → 查 FDV + LP → $20,000 ≤ FDV ≤ $50,000 且 LP ≥ $5,000 → 立即用 0.5 SOL 买入
+//   webhook 收到代币 → 查 FDV + LP → $15,000 ≤ FDV ≤ $60,000 且 LP ≥ $5,000 → 立即用 0.5 SOL 买入
 //   条件不满足 → 静默拒绝，不再跟踪
 //
 // 出场策略（EMA 只用于出场）：
@@ -9,8 +9,8 @@
 //   2. 移动止损  峰值回撤 -30%（峰值涨幅 50%+ 后激活）
 //   3. 分批止盈  TP1/TP2/TP3
 //   4. EMA死叉   EMA9 < EMA20 且 EMA20 斜率向下，连续 2 根 5min K线确认
-//   5. FDV跌破   $20,000 强制清仓
-//   6. 监控到期  4小时后清仓退出
+//   5. FDV跌破   $10,000 强制清仓
+//   6. 监控到期  2小时后清仓退出
 
 'use strict';
 
@@ -22,9 +22,9 @@ const logger                           = require('./logger');
 
 const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '1');   // 1秒价格轮询 + 止损检查
 const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '300'); // 5分钟K线 + EMA死叉
-const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '240');
-const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD           || '20000');
-const FDV_MAX_USD        = parseInt(process.env.FDV_MAX_USD           || '50000');
+const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '120');
+const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD           || '15000');
+const FDV_MAX_USD        = parseInt(process.env.FDV_MAX_USD           || '60000');
 const LP_MIN_USD         = parseInt(process.env.LP_MIN_USD            || '5000');
 const MAX_TICKS_HISTORY  = 60 * 60 * 3;  // 3h × 12 ticks/min = 2160 ticks max
 
@@ -187,7 +187,7 @@ class TokenMonitor {
   start() {
     logger.info(
       `[Monitor] Starting — poll ${PRICE_POLL_SEC}s | kline ${KLINE_INTERVAL_SEC}s` +
-      ` | FDV_MIN $${FDV_MIN_USD} | max_age ${TOKEN_MAX_AGE_MIN}min`
+      ` | FDV_MIN $${FDV_MIN_USD} | FDV_MAX $${FDV_MAX_USD} | max_age ${TOKEN_MAX_AGE_MIN}min`
     );
     this._pollTimer  = setInterval(() => this._pollPrices(),  PRICE_POLL_SEC * 1000);
     this._klineTimer = setInterval(() => this._evaluateAll(), KLINE_INTERVAL_SEC * 1000);
