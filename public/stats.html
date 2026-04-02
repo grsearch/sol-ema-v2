@@ -174,12 +174,10 @@ function fmtTime(ts) {
 
 function exitBadge(reason) {
   if (!reason) return '<span class="badge badge-cyan">持仓中</span>';
-  if (reason.includes('STOP_LOSS')) return '<span class="badge badge-red">硬止损</span>';
-  if (reason.includes('TRAIL')) return '<span class="badge badge-yellow">移动止损</span>';
-  if (reason.includes('TP1') || reason.includes('TP2') || reason.includes('TP3'))
-    return '<span class="badge badge-green">分批止盈</span>';
   if (reason.includes('AGE_EXPIRY')) return '<span class="badge badge-gray">到期</span>';
-  if (reason.includes('EMA') || reason.includes('SELL')) return '<span class="badge badge-yellow">EMA死叉</span>';
+  if (reason.includes('MANUAL')) return '<span class="badge badge-yellow">手动</span>';
+  if (reason.includes('EMA') || reason.includes('SELL') || reason.includes('死叉'))
+    return '<span class="badge badge-yellow">EMA死叉</span>';
   return `<span class="badge badge-gray">${reason.slice(0,12)}</span>`;
 }
 

@@ -1,13 +1,12 @@
-// src/trader.js — Jupiter-based auto-trader with MEV protection & tiered take-profit
+// src/trader.js — Jupiter-based auto-trader with MEV protection
 //
 // Architecture:
 //   • Uses Jupiter Ultra API (Pro I) for swap quote + execute
 //   • Anti-sandwich via Jito bundle tip + priority fee
-//   • Tiered TP: DISABLED (set TP_ENABLED=true to re-enable)
-//   • Hard stop-loss: -25% from entry
-//   • Trailing stop: 30% pullback from peak, activates once up 50%+
-//   • EMA death-cross: sells remainder of position
+//   • EMA death-cross: EMA9 下穿 EMA20 立即全仓卖出
 //   • Dynamic slippage retry: each retry widens slippage ×1.5, max 2000 bps
+//
+// 已删除：硬止损、移动止损、分批止盈（全部由 EMA 死叉统一处理）
 
 'use strict';
 
@@ -33,19 +32,6 @@ const SLIPPAGE_MAX_BPS = 2000;
 function jupHeaders() {
   return JUP_API_KEY ? { 'x-api-key': JUP_API_KEY } : {};
 }
-
-// Take-profit（暂停：TP_ENABLED=true 可重新启用）
-const TP_ENABLED = process.env.TP_ENABLED === 'true';
-const TP1_PCT    = parseFloat(process.env.TP1_PCT  || '100');
-const TP1_SELL   = parseFloat(process.env.TP1_SELL || '33');
-const TP2_PCT    = parseFloat(process.env.TP2_PCT  || '200');
-const TP2_SELL   = parseFloat(process.env.TP2_SELL || '33');
-const TP3_PCT    = parseFloat(process.env.TP3_PCT  || '400');
-const TP3_SELL   = parseFloat(process.env.TP3_SELL || '50');
-
-const STOP_LOSS_PCT      = parseFloat(process.env.STOP_LOSS_PCT      || '25');
-const TRAIL_PCT          = parseFloat(process.env.TRAIL_PCT          || '30');
-const TRAIL_ACTIVATE_PCT = parseFloat(process.env.TRAIL_ACTIVATE_PCT || '50');
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
@@ -141,14 +127,6 @@ async function buildSellOrder(tokenMint, tokenAmount, slippageBps) {
 }
 
 // ── Dynamic-slippage retry ─────────────────────────────────────
-//
-// orderFn: (slippageBps: number) => Promise<JupiterOrder>
-//   每次重试都重新拉报价（价格更新鲜），并将滑点 ×1.5，
-//   上限为 SLIPPAGE_MAX_BPS（20%）。
-//
-// 首次:   SLIPPAGE_BPS        (5%  = 500)
-// 重试1:  min(500×1.5, 2000)  (7.5% = 750)
-// 重试2:  min(750×1.5, 2000)  (11.25% → 1125)
 async function executeWithRetry(orderFn, retries = 3) {
   let slippage = SLIPPAGE_BPS;
 
@@ -201,7 +179,7 @@ async function buy(tokenState) {
     const tokenBalance     = parseInt(result.outputAmountResult || '0');
     const solSpentLamports = parseInt(result.inputAmountResult  || String(solLamports));
 
-    // 买入完成后重拉价格作为开仓基准，避免执行耗时导致止损基准偏移
+    // 买入完成后重拉价格作为开仓基准
     let entryPriceUsd = currentPrice;
     try {
       const freshPrice = await require('./birdeye').getPrice(address);
@@ -225,7 +203,6 @@ async function buy(tokenState) {
       tokenBalance,
       initialBalance: tokenBalance,
       solSpent:       solSpentLamports / LAMPORTS_PER_SOL,
-      tpHit:          [],
       txBuy:          result.signature,
       entryPriceUsd,
       peakPriceUsd:   entryPriceUsd,
@@ -239,7 +216,7 @@ async function buy(tokenState) {
   }
 }
 
-// ── SELL (partial or full) ─────────────────────────────────────
+// ── SELL (full position) ──────────────────────────────────────
 async function sell(tokenState, fraction, reason) {
   const { address, symbol, currentPrice, position } = tokenState;
   if (!position || position.tokenBalance <= 0) return null;
@@ -273,78 +250,7 @@ async function sell(tokenState, fraction, reason) {
   }
 }
 
-// ── Position manager（每秒调用）────────────────────────────────
-//
-// 出场优先级：
-//   1. 硬止损      -50%
-//   2. 移动止损    峰值涨幅 ≥ 50% 激活，峰值回撤 -30% 触发
-//   3. 分批止盈    暂停（TP_ENABLED=false）
-// Returns: 'HOLD' | 'PARTIAL' | 'EXIT' | 'NONE'
-async function managePosition(tokenState) {
-  const { currentPrice, position, symbol } = tokenState;
-  if (!position || position.tokenBalance <= 0) return 'NONE';
-
-  const entryPriceUsd = position.entryPriceUsd;
-  if (!entryPriceUsd || !currentPrice) return 'HOLD';
-
-  const pnlPct = (currentPrice - entryPriceUsd) / entryPriceUsd * 100;
-
-  if (currentPrice > (position.peakPriceUsd ?? 0)) {
-    tokenState.position.peakPriceUsd = currentPrice;
-  }
-  const peakPriceUsd = tokenState.position.peakPriceUsd;
-  const peakPnlPct   = (peakPriceUsd - entryPriceUsd) / entryPriceUsd * 100;
-
-  tokenState.pnlPct = pnlPct.toFixed(2);
-
-  // ── 1. 硬止损 -50% ─────────────────────────────────────────
-  if (pnlPct <= -STOP_LOSS_PCT) {
-    logger.warn(`[Trader] STOP-LOSS ${symbol} PnL=${pnlPct.toFixed(1)}%`);
-    tokenState.position = await sell(tokenState, 1.0, `STOP_LOSS_${STOP_LOSS_PCT}%`);
-    return 'EXIT';
-  }
-
-  // ── 2. 移动止损 ────────────────────────────────────────────
-  if (peakPnlPct >= TRAIL_ACTIVATE_PCT) {
-    const trailStop = peakPriceUsd * (1 - TRAIL_PCT / 100);
-    if (currentPrice <= trailStop) {
-      logger.warn(
-        `[Trader] TRAIL-STOP ${symbol}` +
-        ` peak=+${peakPnlPct.toFixed(0)}%` +
-        ` trailStop=${trailStop.toExponential(3)}` +
-        ` now=${pnlPct.toFixed(1)}%`
-      );
-      tokenState.position = await sell(tokenState, 1.0, `TRAIL_STOP_peak+${peakPnlPct.toFixed(0)}%`);
-      return 'EXIT';
-    }
-  }
-
-  // ── 3. 分批止盈（暂停中，TP_ENABLED=false）─────────────────
-  if (TP_ENABLED) {
-    let acted = false;
-
-    if (!position.tpHit.includes('TP1') && pnlPct >= TP1_PCT) {
-      tokenState.position.tpHit.push('TP1');
-      tokenState.position = await sell(tokenState, TP1_SELL / 100, `TP1_+${TP1_PCT}%`);
-      acted = true;
-    } else if (!position.tpHit.includes('TP2') && pnlPct >= TP2_PCT) {
-      tokenState.position.tpHit.push('TP2');
-      tokenState.position = await sell(tokenState, TP2_SELL / 100, `TP2_+${TP2_PCT}%`);
-      acted = true;
-    } else if (!position.tpHit.includes('TP3') && pnlPct >= TP3_PCT) {
-      tokenState.position.tpHit.push('TP3');
-      tokenState.position = await sell(tokenState, TP3_SELL / 100, `TP3_+${TP3_PCT}%`);
-      acted = true;
-    }
-
-    if (!tokenState.position || tokenState.position.tokenBalance <= 0) return 'EXIT';
-    return acted ? 'PARTIAL' : 'HOLD';
-  }
-
-  return 'HOLD';
-}
-
-// ── EMA death-cross exit ───────────────────────────────────────
+// ── EMA death-cross exit (全仓卖出) ───────────────────────────
 async function exitPosition(tokenState, reason) {
   if (!tokenState.position || tokenState.position.tokenBalance <= 0) return;
   tokenState.position = await sell(tokenState, 1.0, reason);
@@ -363,4 +269,4 @@ function _broadcastTrade(type, symbol, mint, price, amount, sig, reason = '') {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-module.exports = { buy, sell, exitPosition, managePosition, getKeypair, getConn };
+module.exports = { buy, sell, exitPosition, getKeypair, getConn };

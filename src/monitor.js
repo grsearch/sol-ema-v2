@@ -4,13 +4,11 @@
 //   webhook 收到代币 → 查 FDV + LP → $15,000 ≤ FDV ≤ $60,000 且 LP ≥ $5,000 → 立即用 0.5 SOL 买入
 //   条件不满足 → 静默拒绝，不再跟踪
 //
-// 出场策略（EMA 只用于出场）：
-//   1. 硬止损    -30%
-//   2. 移动止损  峰值回撤 -30%（峰值涨幅 50%+ 后激活）
-//   3. 分批止盈  TP1/TP2/TP3
-//   4. EMA死叉   EMA9 < EMA20 且 EMA20 斜率向下，连续 2 根 5min K线确认
-//   5. FDV跌破   $10,000 强制清仓
-//   6. 监控到期  2小时后清仓退出
+// 出场策略（纯 EMA 死叉）：
+//   1. EMA死叉   EMA9 下穿 EMA20 立即卖出（15秒K线，5秒轮询）
+//   2. 监控到期  30分钟后清仓退出
+//
+// 已删除：硬止损、浮动止盈、分批止盈
 
 'use strict';
 
@@ -20,13 +18,13 @@ const trader                           = require('./trader');
 const { broadcastToClients }           = require('./wsHub');
 const logger                           = require('./logger');
 
-const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '1');   // 1秒价格轮询 + 止损检查
-const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '300'); // 5分钟K线 + EMA死叉
-const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '120');
+const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '5');   // 5秒价格轮询
+const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '15');  // 15秒K线
+const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '30');  // 30分钟监控期
 const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD           || '15000');
 const FDV_MAX_USD        = parseInt(process.env.FDV_MAX_USD           || '60000');
 const LP_MIN_USD         = parseInt(process.env.LP_MIN_USD            || '5000');
-const MAX_TICKS_HISTORY  = 60 * 60 * 3;  // 3h × 12 ticks/min = 2160 ticks max
+const MAX_TICKS_HISTORY  = 60 * 60 * 1;  // 1h × 12 ticks/min (5s poll) = 720 ticks max
 
 class TokenMonitor {
   static instance = null;
@@ -40,7 +38,6 @@ class TokenMonitor {
     this.tradeLog    = [];          // last 200 trade entries (实时feed)
     this.tradeRecords = [];         // 24h完整交易记录（用于统计dashboard）
     this._pollTimer  = null;
-    this._klineTimer = null;
     this._metaTimer  = null;
     this._ageTimer   = null;
     this._dashTimer  = null;
@@ -75,13 +72,10 @@ class TokenMonitor {
       // Position tracking (null = no open position)
       position:     null,
       pnlPct:       null,
-      // EMA state（仅用于出场判断）
-      bearishCount: 0,
       // Lifecycle flags
       bought:       false,
       exitSent:     false,
       inPosition:   false,
-      managing:     false,
     };
 
     this.tokens.set(address, state);
@@ -174,10 +168,6 @@ class TokenMonitor {
       if (created) {
         state.age = ((Date.now() - created * 1000) / 60000).toFixed(1);
       }
-
-      // 注意：持仓期间不再因 FDV 下跌触发退出
-      // 新币 FDV 极不稳定，买入后几秒内 Birdeye 重算可能导致误判
-      // FDV 门槛仅在收录时（_fetchMetaAndBuy）做一次性判断
     } catch (e) {
       logger.warn(`[Monitor] meta refresh error ${state.symbol}: ${e.message}`);
     }
@@ -189,8 +179,8 @@ class TokenMonitor {
       `[Monitor] Starting — poll ${PRICE_POLL_SEC}s | kline ${KLINE_INTERVAL_SEC}s` +
       ` | FDV_MIN $${FDV_MIN_USD} | FDV_MAX $${FDV_MAX_USD} | max_age ${TOKEN_MAX_AGE_MIN}min`
     );
-    this._pollTimer  = setInterval(() => this._pollPrices(),  PRICE_POLL_SEC * 1000);
-    this._klineTimer = setInterval(() => this._evaluateAll(), KLINE_INTERVAL_SEC * 1000);
+    // 价格轮询 + EMA评估合并为同一个定时器（每5秒）
+    this._pollTimer  = setInterval(() => this._pollAndEvaluate(), PRICE_POLL_SEC * 1000);
     this._metaTimer  = setInterval(async () => {
       for (const s of this.tokens.values()) {
         await this._fetchMeta(s);
@@ -206,19 +196,16 @@ class TokenMonitor {
   }
 
   stop() {
-    [this._pollTimer, this._klineTimer, this._metaTimer, this._ageTimer, this._dashTimer, this._fdvTimer]
+    [this._pollTimer, this._metaTimer, this._ageTimer, this._dashTimer, this._fdvTimer]
       .forEach(t => t && clearInterval(t));
     logger.info('[Monitor] Stopped');
   }
 
-  // ── 价格轮询 + 止损/止盈检查 每 PRICE_POLL_SEC (1s) ──────────
+  // ── 价格轮询 + EMA死叉评估 每 PRICE_POLL_SEC (5s) ──────────
   //
-  // 1秒拉一次价格，拉完立即检查：
-  //   • 硬止损 -25%
-  //   • 移动止损 峰值涨幅≥30% 后激活，回撤-30% 触发
-  //   • 分批止盈 TP1/TP2/TP3
-  // EMA死叉 由 _evaluateAll (5分钟) 单独处理
-  async _pollPrices() {
+  // 每5秒拉一次价格，聚合成15秒K线，检查 EMA9/EMA20 死叉
+  // 已删除：硬止损、浮动止盈、分批止盈（全部由 EMA 死叉统一处理）
+  async _pollAndEvaluate() {
     for (const [addr, state] of this.tokens.entries()) {
       if (state.exitSent || !state.bought) continue;
 
@@ -230,69 +217,36 @@ class TokenMonitor {
           state.ticks.splice(0, state.ticks.length - MAX_TICKS_HISTORY);
         }
 
-        // 更新实时 PnL 由 managePosition 负责（基于Jupiter SOL报价）
-        // 这里仅更新 dashboard 显示用的 USD 峰值
+        // 更新 PnL 显示
+        if (state.inPosition && state.position && state.position.entryPriceUsd) {
+          const pnlPct = (price - state.position.entryPriceUsd) / state.position.entryPriceUsd * 100;
+          state.pnlPct = pnlPct.toFixed(2);
+        }
+
+        // 更新 dashboard 显示用的峰值
         if (state.position && price > (state.position.peakPriceUsd ?? 0)) {
           state.position.peakPriceUsd = price;
         }
 
-        // ── 持仓中：每次拿到新价格立即检查止损/止盈 ──────────
-        if (state.inPosition && state.position && !state.exitSent && !state.managing) {
-          state.managing = true;   // 加锁，防止1秒内并发触发两次
-          try {
-            const action = await trader.managePosition(state);
+        // ── EMA 死叉评估 ──────────────────────────────────────
+        if (state.inPosition && state.ticks.length >= 2) {
+          state.candles = buildCandles(state.ticks, KLINE_INTERVAL_SEC);
+          const closedCandles = state.candles.length > 1
+            ? state.candles.slice(0, -1)
+            : state.candles;
 
-            if (action === 'EXIT') {
-              state.inPosition = false;
-              state.position   = null;
-              state.exitSent   = true;
-              this._addTradeLog({ type: 'EXIT', symbol: state.symbol, reason: 'stop_or_trail' });
-              this._finalizeTradeRecord(state, 'stop_or_trail');
-              setTimeout(() => this._removeToken(addr, 'STOP_OR_TRAIL'), 5000);
+          const result = evaluateSignal(closedCandles, state);
+          state.ema9   = result.ema9;
+          state.ema20  = result.ema20;
 
-            } else if (action === 'PARTIAL') {
-              this._addTradeLog({ type: 'PARTIAL_SELL', symbol: state.symbol });
-              if (!state.position || state.position.tokenBalance <= 0) {
-                state.inPosition = false;
-                state.position   = null;
-                state.exitSent   = true;
-                setTimeout(() => this._removeToken(addr, 'PARTIAL_FULLY_SOLD'), 5000);
-              }
-            }
-          } finally {
-            state.managing = false;  // 无论成功失败都释放锁
+          if (result.signal === 'SELL') {
+            logger.warn(`[Strategy] EMA死叉 SELL ${state.symbol} — ${result.reason}`);
+            await this._doExit(state, result.reason);
           }
         }
       }
 
-      await sleep(10);  // 10ms 间隔错开 Birdeye 请求（1s轮询下最多100个代币仍安全）
-    }
-  }
-
-  // ── EMA死叉评估 每 KLINE_INTERVAL_SEC (5min) ────────────────
-  // 只负责 EMA9 下穿 EMA20 的趋势出场，止损/止盈已在 _pollPrices 处理
-  async _evaluateAll() {
-    for (const [addr, state] of this.tokens.entries()) {
-      if (state.exitSent || !state.bought || !state.ticks.length) continue;
-
-      // 构建K线（所有代币都更新，dashboard 图表需要）
-      state.candles = buildCandles(state.ticks, KLINE_INTERVAL_SEC);
-      const closedCandles = state.candles.length > 1
-        ? state.candles.slice(0, -1)
-        : state.candles;
-
-      // 计算 EMA（用于 dashboard 显示）
-      const result = evaluateSignal(closedCandles, state);
-      state.ema9   = result.ema9;
-      state.ema20  = result.ema20;
-
-      if (!state.inPosition) continue;  // 不持仓无需死叉出场
-
-      // EMA 死叉出场（同样检查锁，避免和 _pollPrices 竞态）
-      if (result.signal === 'SELL' && !state.managing) {
-        logger.warn(`[Strategy] EMA死叉 SELL ${state.symbol} — ${result.reason}`);
-        await this._doExit(state, result.reason);
-      }
+      await sleep(10);  // 10ms 间隔错开 Birdeye 请求
     }
   }
 
@@ -314,9 +268,7 @@ class TokenMonitor {
     for (const [addr, state] of this.tokens.entries()) {
       if (state.exitSent) continue;
 
-      const ageMin = state.age !== null
-        ? parseFloat(state.age)
-        : (Date.now() - state.addedAt) / 60000;
+      const ageMin = (Date.now() - state.addedAt) / 60000;
 
       if (ageMin < maxMin) continue;
 
@@ -432,10 +384,9 @@ class TokenMonitor {
       lp:            s.lp,
       fdv:           s.fdv,
       currentPrice:  s.currentPrice,
-      entryPrice:    pos?.entryPriceUsd ?? pos?.entryPrice ?? null,  // dashboard显示USD价格
-      peakPrice:     pos?.peakPriceUsd  ?? pos?.peakPrice  ?? null,  // dashboard显示USD峰值
+      entryPrice:    pos?.entryPriceUsd ?? null,
+      peakPrice:     pos?.peakPriceUsd  ?? null,
       tokenBalance:  pos?.tokenBalance  ?? 0,
-      tpHit:         pos?.tpHit         ?? [],
       pnlPct:        s.pnlPct,
       ema9:          isNaN(s.ema9)  ? null : +s.ema9.toFixed(10),
       ema20:         isNaN(s.ema20) ? null : +s.ema20.toFixed(10),

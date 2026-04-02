@@ -201,13 +201,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
       <div class="sb-item"><div class="sb-lbl">持仓</div><div class="sb-val" style="color:var(--green)" id="stat-positions">0</div></div>
       <div class="sb-item"><div class="sb-lbl">买入</div><div class="sb-val" style="color:var(--green)" id="stat-buys">0</div></div>
       <div class="sb-item"><div class="sb-lbl">卖出</div><div class="sb-val" style="color:var(--red)" id="stat-sells">0</div></div>
-      <div class="sb-item"><div class="sb-lbl">分批止盈</div><div class="sb-val" style="color:var(--orange)" id="stat-partials">0</div></div>
     </div>
 
     <div class="section-header">
       <span class="section-title">监控白名单 <span class="badge" id="token-count-badge">0</span></span>
       <span style="font-family:var(--mono);font-size:9px;color:var(--text3)">
-        5m K线 · 收录即买(0.5 SOL) · 分批止盈+移动止损 · EMA死叉清仓
+        15s K线 · 5s轮询 · 收录即买(0.5 SOL) · EMA9下穿EMA20死叉清仓 · 30min监控期
       </span>
     </div>
 
@@ -235,24 +234,18 @@ header{display:flex;align-items:center;justify-content:space-between;padding:10p
     <div class="side-section">
       <div class="section-header"><span class="section-title">策略配置</span></div>
       <div class="config-grid">
-        <div class="cfg-item"><div class="cfg-label">K线周期</div><div class="cfg-value">5min</div></div>
-        <div class="cfg-item"><div class="cfg-label">确认Bars</div><div class="cfg-value">2</div></div>
-        <div class="cfg-item"><div class="cfg-label">TP1 +100%</div><div class="cfg-value">卖33%</div></div>
-        <div class="cfg-item"><div class="cfg-label">TP2 +200%</div><div class="cfg-value">卖33%</div></div>
-        <div class="cfg-item"><div class="cfg-label">TP3 +400%</div><div class="cfg-value">卖50%</div></div>
-        <div class="cfg-item"><div class="cfg-label">止损</div><div class="cfg-value">-25%</div></div>
-        <div class="cfg-item"><div class="cfg-label">移动止损</div><div class="cfg-value">-30%</div></div>
+        <div class="cfg-item"><div class="cfg-label">K线周期</div><div class="cfg-value">15s</div></div>
+        <div class="cfg-item"><div class="cfg-label">轮询间隔</div><div class="cfg-value">5s</div></div>
+        <div class="cfg-item"><div class="cfg-label">EMA快线</div><div class="cfg-value">EMA9</div></div>
+        <div class="cfg-item"><div class="cfg-label">EMA慢线</div><div class="cfg-value">EMA20</div></div>
+        <div class="cfg-item"><div class="cfg-label">监控期</div><div class="cfg-value">30min</div></div>
         <div class="cfg-item"><div class="cfg-label">运行时间</div><div class="cfg-value" id="cfg-uptime">0s</div></div>
       </div>
       <div style="margin-top:10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:9px 11px">
-        <div style="font-family:var(--mono);font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px">出场优先级</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:5px">出场策略</div>
         <div style="font-size:11px;color:var(--text2);line-height:1.9">
-          1️⃣ 硬止损 -25% → 立即清仓<br/>
-          2️⃣ 移动止损 峰值-30% → 立即清仓<br/>
-          3️⃣ 分批止盈 TP1/TP2/TP3<br/>
-          4️⃣ EMA死叉 → 清仓剩余<br/>
-          5️⃣ FDV跌破$2万 → 清仓退出<br/>
-          6️⃣ 监控4小时到期 → 清仓退出
+          1️⃣ EMA9 下穿 EMA20 → 死叉立即清仓<br/>
+          2️⃣ 监控30分钟到期 → 清仓退出
         </div>
       </div>
     </div>
@@ -267,7 +260,7 @@ const WS_URL = `ws://${location.host}/ws`;
 let ws, reconnectTimer;
 let tokenData  = {};
 let tradeData  = [];
-let sessionBuys = 0, sessionSells = 0, sessionPartials = 0;
+let sessionBuys = 0, sessionSells = 0;
 
 setInterval(() => {
   document.getElementById('clock').textContent =
@@ -295,7 +288,6 @@ function handleMsg(msg) {
       (msg.data.tokens || []).forEach(t => tokenData[t.address] = t);
       sessionBuys     = tradeData.filter(t => t.type === 'BUY').length;
       sessionSells    = tradeData.filter(t => t.type === 'SELL' || t.type === 'EXIT').length;
-      sessionPartials = tradeData.filter(t => t.type === 'PARTIAL_SELL').length;
       renderAll(); updateStats(); updateUptime(msg.data.uptime);
       break;
     case 'update':
@@ -318,7 +310,6 @@ function handleMsg(msg) {
       const d = msg.data;
       tradeData.unshift(d);
       if(d.type === 'BUY')          { sessionBuys++; toast(`🟢 买入: ${d.symbol}`, 'buy'); }
-      else if(d.type === 'PARTIAL_SELL') { sessionPartials++; toast(`🟠 分批止盈: ${d.symbol} (${d.reason})`, 'partial'); }
       else if(d.type === 'SELL' || d.type === 'EXIT') { sessionSells++; toast(`🔴 卖出: ${d.symbol} — ${d.reason||''}`, 'sell'); }
       prependTradeEntry(d);
       document.getElementById('trade-count-badge').textContent = tradeData.length;
@@ -390,16 +381,9 @@ function upsertCard(t) {
   else if(t.inPosition){sigBadge='BUY';sigLbl='IN POSITION';}
   else if(t.lastSignal==='SELL'){sigBadge='SELL';sigLbl='SOLD';}
 
-  // TP levels HTML
-  const tpHit = t.tpHit || [];
-  const tpHTML = `<div class="tp-bar">
-    <div class="tp-bar-label">分批止盈进度</div>
-    <div class="tp-levels">
-      <div class="tp-level ${tpHit.includes('TP1')?'hit':(t.inPosition&&pnl>=100?'active':'')}">TP1 +100%<br>卖33%</div>
-      <div class="tp-level ${tpHit.includes('TP2')?'hit':(t.inPosition&&pnl>=200?'active':'')}">TP2 +200%<br>卖33%</div>
-      <div class="tp-level ${tpHit.includes('TP3')?'hit':(t.inPosition&&pnl>=400?'active':'')}">TP3 +400%<br>卖50%</div>
-      <div class="tp-level" style="${t.inPosition&&!tpHit.includes('TP3')?'':''}">EMA死叉<br>清仓</div>
-    </div>
+  // Exit strategy indicator (EMA death cross only)
+  const exitHTML = `<div class="tp-bar">
+    <div class="tp-bar-label">出场策略：EMA9 下穿 EMA20 死叉立即卖出</div>
   </div>`;
 
   card.className = `token-card ${cardState}`;
@@ -429,7 +413,7 @@ function upsertCard(t) {
       ${t.peakPrice  ? `<div class="ema-item"><span class="ema-label">峰值</span><span class="ema-val" style="color:var(--orange)">${(+t.peakPrice).toExponential(4)}</span></div>` : ''}
       <div class="ema-cross ${crossCls}">${crossLbl||'WARMING UP'}</div>
     </div>
-    ${t.inPosition ? tpHTML : ''}
+    ${t.inPosition ? exitHTML : ''}
     <div class="position-bar">
       <span class="pos-indicator ${t.inPosition?'holding':'flat'}">${t.inPosition?'● 持仓中':'○ 空仓'}</span>
       ${t.tokenBalance>0?`<span style="color:var(--text2)">余额 <span style="color:var(--green)">${t.tokenBalance}</span></span>`:''}
@@ -456,12 +440,12 @@ function renderMiniChart(t) {
     svg+=`<line x1="${px+cw/2}" y1="${wt}" x2="${px+cw/2}" y2="${wb}" stroke="${col}" stroke-width="0.6" opacity=".5"/>`;
     svg+=`<rect x="${px+0.5}" y="${bt}" width="${Math.max(1,cw-1)}" height="${bh}" fill="${col}" opacity=".75"/>`;
   });
-  return `<div class="card-chart"><div class="chart-label">K线 (最近${c.length}根 · 5m)</div><div class="mini-chart"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${svg}</svg></div></div>`;
+  return `<div class="card-chart"><div class="chart-label">K线 (最近${c.length}根 · 15s)</div><div class="mini-chart"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${svg}</svg></div></div>`;
 }
 
 function tradeEntryHTML(d) {
   const t = new Date(d.time).toLocaleTimeString('zh-CN',{hour12:false});
-  const typeLabel = {BUY:'买入',SELL:'清仓',EXIT:'止损',PARTIAL_SELL:'分批'}[d.type]||d.type;
+  const typeLabel = {BUY:'买入',SELL:'清仓',EXIT:'退出'}[d.type]||d.type;
   return `<div class="trade-entry">
     <span class="te-type ${d.type}">${typeLabel}</span>
     <div class="te-info">
@@ -488,7 +472,6 @@ function updateStats() {
   document.getElementById('stat-positions').textContent = positions;
   document.getElementById('stat-buys').textContent      = sessionBuys;
   document.getElementById('stat-sells').textContent     = sessionSells;
-  document.getElementById('stat-partials').textContent  = sessionPartials;
 }
 
 function updateUptime(s) {

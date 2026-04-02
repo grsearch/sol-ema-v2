@@ -21,7 +21,7 @@ router.get('/tokens', (req, res) => {
     entryPrice:   s.position?.entryPrice  ?? null,
     peakPrice:    s.position?.peakPrice   ?? null,
     tokenBalance: s.position?.tokenBalance ?? 0,
-    tpHit:        s.position?.tpHit       ?? [],
+
     pnlPct:       s.pnlPct,
     lastSignal:   s.lastSignal,
     inPosition:   s.inPosition,

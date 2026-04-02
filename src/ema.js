@@ -1,15 +1,14 @@
 // src/ema.js — EMA calculation + SELL signal logic
 //
-// Candle width: KLINE_INTERVAL_SEC (default 300 = 5 minutes)
-// Price poll  : PRICE_POLL_SEC     (default 60 = 1 minute)
+// Candle width: KLINE_INTERVAL_SEC (default 15 = 15秒K线)
+// Price poll  : PRICE_POLL_SEC     (default 5  = 5秒轮询)
 //
 // BUY  : 收录即买，由 monitor._fetchMetaAndBuy() 直接执行，本模块不处理
-// SELL : EMA9 < EMA20 AND EMA20 下行，连续 CONFIRM_BARS 根已收盘K线确认
+// SELL : EMA9 下穿 EMA20 立即卖出（无需斜率确认，无需连续K线确认）
 
-const EMA_FAST     = parseInt(process.env.EMA_FAST           || '9');
-const EMA_SLOW     = parseInt(process.env.EMA_SLOW           || '20');
-const CONFIRM_BARS = parseInt(process.env.EMA_CONFIRM_BARS   || '2');
-const KLINE_SEC    = parseInt(process.env.KLINE_INTERVAL_SEC || '300');
+const EMA_FAST  = parseInt(process.env.EMA_FAST           || '9');
+const EMA_SLOW  = parseInt(process.env.EMA_SLOW           || '20');
+const KLINE_SEC = parseInt(process.env.KLINE_INTERVAL_SEC || '15');
 
 /**
  * Calculate EMA array for a price series (oldest-first).
@@ -38,7 +37,11 @@ function calcEMA(closes, period) {
  * Evaluate SELL signal from closed candles.
  * BUY is handled upstream (收录即买)，本函数只判断死叉出场。
  *
- * tokenState fields read/mutated: bearishCount
+ * SELL条件：EMA9 下穿 EMA20（死叉），立即触发
+ *   - 上一根K线 EMA9 >= EMA20
+ *   - 当前K线   EMA9 <  EMA20
+ *   → 无需 EMA20 斜率向下，无需连续确认
+ *
  * Returns: { ema9, ema20, signal: null|'SELL', reason }
  */
 function evaluateSignal(candles, tokenState) {
@@ -48,32 +51,26 @@ function evaluateSignal(candles, tokenState) {
   const len    = closes.length;
 
   if (len < EMA_SLOW + 1) {
-    tokenState.bearishCount = 0;
     return { ema9: NaN, ema20: NaN, signal: null, reason: 'warming_up' };
   }
 
   const ema9_now   = ema9s[len - 1];
   const ema20_now  = ema20s[len - 1];
+  const ema9_prev  = ema9s[len - 2];
   const ema20_prev = ema20s[len - 2];
 
-  if (isNaN(ema9_now) || isNaN(ema20_now) || isNaN(ema20_prev)) {
+  if (isNaN(ema9_now) || isNaN(ema20_now) || isNaN(ema9_prev) || isNaN(ema20_prev)) {
     return { ema9: NaN, ema20: NaN, signal: null, reason: 'ema_nan' };
   }
 
-  const bearish   = ema9_now < ema20_now;    // EMA9 在 EMA20 下方
-  const declining = ema20_now < ema20_prev;  // EMA20 斜率向下
+  // 死叉判断：上一根K线 EMA9 >= EMA20，当前K线 EMA9 < EMA20 → 立即卖出
+  const wasAbove = ema9_prev >= ema20_prev;
+  const nowBelow = ema9_now  <  ema20_now;
 
-  // SELL 死叉：EMA9 下穿 EMA20 且 EMA20 斜率向下，连续确认
-  if (bearish && declining) {
-    tokenState.bearishCount = (tokenState.bearishCount || 0) + 1;
-  } else {
-    tokenState.bearishCount = 0;
-  }
-
-  if (tokenState.bearishCount >= CONFIRM_BARS) {
+  if (wasAbove && nowBelow) {
     return {
       ema9: ema9_now, ema20: ema20_now, signal: 'SELL',
-      reason: `EMA${EMA_FAST}<EMA${EMA_SLOW} & EMA${EMA_SLOW}↓ ×${tokenState.bearishCount}bars`,
+      reason: `EMA${EMA_FAST}下穿EMA${EMA_SLOW}_死叉立即卖出`,
     };
   }
 
